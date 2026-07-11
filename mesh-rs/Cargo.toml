@@ -22,10 +22,17 @@ interprocess = { version = "2.4.2", features = ["tokio"] }
 # iroh's API churns across releases; pin it EXACTLY. This code targets the iroh 1.0.2 API
 # (EndpointId/EndpointAddr, presets::Minimal, Router/ProtocolHandler, conn.open_bi/accept_bi).
 iroh = "=1.0.2"
+# LAN auto-discovery: iroh 1.0.2 renamed "discovery" to "address lookup"; the mDNS
+# (swarm-discovery) variant lives in this companion crate, pinned to its iroh-1.0 line.
+# It scopes discovery by mDNS service name (we fold the room into it) and the ALPN keeps
+# the hard room-isolation guarantee at the QUIC handshake.
+iroh-mdns-address-lookup = "=0.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
+# StreamExt::next() for the mDNS discovery event stream.
+tokio-stream = "0.1.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ulid = "1.2.1"

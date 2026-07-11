@@ -1,6 +1,7 @@
 //! `clip` — mesh-rs Phase 0 CLI. Global flags + subcommands per docs/SPEC.md §2.
 
 mod client;
+mod clipboard;
 mod config;
 mod daemon;
 mod proto;

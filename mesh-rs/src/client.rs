@@ -272,6 +272,7 @@ pub async fn cmd_status(paths: &Paths, json: bool) -> Result<i32> {
                 println!("room:       {}", s.room);
                 println!("transport:  {}", s.transport);
                 println!("auto_copy:  {}", s.auto_copy);
+                println!("clipboard:  {}", s.clipboard);
                 println!("peers:      {}", s.peer_count);
                 println!("buffered:   {}", s.buffer_len);
             }

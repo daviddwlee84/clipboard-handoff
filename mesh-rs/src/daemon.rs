@@ -2,7 +2,6 @@
 //! the received-item ring buffer, the trusted-peer set, and the local IPC socket.
 
 use std::{
-    borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
@@ -15,8 +14,10 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
+use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use serde_bytes::ByteBuf;
 use tokio::sync::broadcast;
+use tokio_stream::StreamExt;
 use ulid::Ulid;
 
 use interprocess::local_socket::{
@@ -25,6 +26,7 @@ use interprocess::local_socket::{
     traits::tokio::{Listener as _, Stream as _},
 };
 
+use crate::clipboard;
 use crate::config::{ConfigStore, Paths, default_device_name, load_or_create_secret};
 use crate::proto::*;
 
@@ -46,8 +48,14 @@ pub struct Daemon {
     paths: Paths,
     endpoint: Endpoint,
     device_name: String,
+    /// Probed once at startup: false on a headless host (no display). When false, `paste`
+    /// and auto-copy become clear no-op errors; everything else keeps working.
+    clipboard_available: bool,
     config: Mutex<ConfigStore>,
     peers: Mutex<HashMap<EndpointId, PeerHandle>>,
+    /// Peers we're currently dialing via mDNS auto-discovery (in-flight guard, so repeated
+    /// `Discovered` events don't open duplicate connections).
+    dialing: Mutex<HashSet<EndpointId>>,
     allowlist: Mutex<HashSet<EndpointId>>,
     ring: Mutex<VecDeque<Item>>,
     /// Content-addressed PNG store (locally-sent + received), keyed by BLAKE3 hex.
@@ -107,8 +115,19 @@ pub async fn run(paths: Paths) -> Result<()> {
     let device_name = config.get("device_name").unwrap_or_else(default_device_name);
     let alpn = alpn_for_room(&paths.room);
 
-    // LAN-only for Phase 0: Minimal preset (crypto provider only, no discovery) +
-    // relay disabled -> direct QUIC to the addresses carried in the pairing ticket.
+    // Detect a headless host ONCE at startup: if arboard can't open a display, degrade
+    // gracefully — send/recv/paste-to-file/gossip and the daemon all keep working; only
+    // `paste` and auto-copy become clear no-ops. Probe off the runtime (arboard is blocking).
+    let clipboard_available = tokio::task::spawn_blocking(clipboard::probe_available)
+        .await
+        .unwrap_or(false);
+    if !clipboard_available {
+        tracing::warn!("clipboard unavailable (headless) — send/recv/paste-to-file still work");
+    }
+
+    // LAN-only for Phase 0: Minimal preset (crypto provider only) + relay disabled. We add
+    // an mDNS address-lookup service below for zero-config LAN auto-discovery; direct QUIC
+    // then carries the addresses (from a ticket, or from mDNS, or both).
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(secret.clone())
         .alpns(vec![alpn.clone()])
@@ -122,8 +141,10 @@ pub async fn run(paths: Paths) -> Result<()> {
         paths: paths.clone(),
         endpoint: endpoint.clone(),
         device_name,
+        clipboard_available,
         config: Mutex::new(config),
         peers: Mutex::new(HashMap::new()),
+        dialing: Mutex::new(HashSet::new()),
         allowlist: Mutex::new(HashSet::new()),
         ring: Mutex::new(VecDeque::new()),
         blobs: Mutex::new(HashMap::new()),
@@ -133,8 +154,30 @@ pub async fn run(paths: Paths) -> Result<()> {
 
     // Accept loop for inbound iroh connections (same-room ALPN only).
     let _router = Router::builder(endpoint.clone())
-        .accept(alpn, ClipProto(daemon.clone()))
+        .accept(alpn.clone(), ClipProto(daemon.clone()))
         .spawn();
+
+    // LAN auto-discovery: same-`--room` daemons on the same network find each other with no
+    // ticket. Room isolation is enforced twice: (1) the mDNS service name is scoped by room,
+    // so different rooms don't even see each other; (2) the room secret is folded into the
+    // ALPN, so a cross-room dial is rejected at the QUIC handshake. Best-effort: if mDNS
+    // can't start (e.g. no usable IPv4/IPv6), we log and fall back to ticket pairing.
+    match MdnsAddressLookup::builder()
+        .service_name(mdns_service_name(&paths.room))
+        .build(endpoint.id())
+    {
+        Ok(mdns) => match endpoint.address_lookup() {
+            Ok(services) => {
+                services.add(mdns.clone());
+                let d = daemon.clone();
+                let dial_alpn = alpn.clone();
+                tokio::spawn(async move { d.run_discovery(mdns, dial_alpn).await });
+                tracing::info!("mDNS discovery enabled (room-scoped) — same-room peers auto-connect without a ticket");
+            }
+            Err(e) => tracing::warn!("mDNS: address lookup unavailable ({e}); ticket pairing still works"),
+        },
+        Err(e) => tracing::warn!("mDNS discovery unavailable ({e}); ticket pairing still works"),
+    }
 
     tracing::info!(
         "clip daemon up: endpoint {} · room {:?} · socket {}",
@@ -270,7 +313,12 @@ impl Daemon {
         let mode = self.config.lock().unwrap().auto_copy();
         match mode.as_str() {
             "on" => {
-                if let Err(e) = self.write_to_clipboard(&env, local_path.as_deref()).await {
+                if !self.clipboard_available {
+                    // Headless: keep buffering (recv/--emit-path still works); don't spam warns.
+                    tracing::debug!(
+                        "auto_copy on: clipboard unavailable (headless) — item buffered, not copied"
+                    );
+                } else if let Err(e) = self.write_to_clipboard(&env, local_path.as_deref()).await {
                     tracing::warn!("auto_copy on: clipboard write failed: {e:#}");
                 }
             }
@@ -416,12 +464,21 @@ impl Daemon {
                 }
             }
             Req::Paste => {
-                let resp = match self.paste_latest().await {
-                    Ok(desc) => Resp::Ok(OkData::Text(desc)),
-                    Err(e) => Resp::Err {
-                        code: 5,
-                        message: e.to_string(),
-                    },
+                let resp = if !self.clipboard_available {
+                    // Headless no-op: a clear status instead of a panic. The item is still
+                    // buffered — `recv --latest-image --emit-path` / `recv` reach it.
+                    Resp::Err {
+                        code: 1,
+                        message: "clipboard unavailable (headless) — cannot paste; use `recv --emit-path` to get the file".into(),
+                    }
+                } else {
+                    match self.paste_latest().await {
+                        Ok(desc) => Resp::Ok(OkData::Text(desc)),
+                        Err(e) => Resp::Err {
+                            code: 5,
+                            message: e.to_string(),
+                        },
+                    }
                 };
                 write_frame(&mut stream, &resp).await?;
             }
@@ -437,6 +494,11 @@ impl Daemon {
                     room: self.paths.room.clone(),
                     transport: "lan (iroh, relay disabled)".into(),
                     auto_copy,
+                    clipboard: if self.clipboard_available {
+                        "available".into()
+                    } else {
+                        "unavailable".into()
+                    },
                     peer_count,
                     buffer_len,
                 };
@@ -525,14 +587,13 @@ impl Daemon {
     }
 
     async fn write_to_clipboard(&self, env: &Envelope, local_path: Option<&str>) -> Result<()> {
-        enum Payload {
-            Text(String),
-            ImagePng(Vec<u8>),
+        if !self.clipboard_available {
+            bail!("clipboard unavailable (headless) — send/recv/paste-to-file still work");
         }
         let (hash, payload) = match env.typ {
             MsgType::Text => {
                 let text = env.text.clone().unwrap_or_default();
-                (blake3_hex(text.as_bytes()), Payload::Text(text))
+                (blake3_hex(text.as_bytes()), clipboard::Payload::Text(text))
             }
             MsgType::Image => {
                 let blob = env
@@ -547,32 +608,15 @@ impl Daemon {
                     .cloned()
                     .or_else(|| local_path.and_then(|p| std::fs::read(p).ok()))
                     .ok_or_else(|| anyhow!("image bytes unavailable"))?;
-                (blob.hash.clone(), Payload::ImagePng(bytes))
+                (blob.hash.clone(), clipboard::Payload::ImagePng(bytes))
             }
         };
 
-        // arboard is blocking and its Clipboard isn't Send; build + use it inside
-        // the blocking thread so nothing crosses threads.
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut cb = arboard::Clipboard::new().map_err(|e| anyhow!("clipboard init: {e}"))?;
-            match payload {
-                Payload::Text(t) => cb.set_text(t).map_err(|e| anyhow!("set_text: {e}"))?,
-                Payload::ImagePng(png) => {
-                    let img = image::load_from_memory(&png)
-                        .context("decode png")?
-                        .to_rgba8();
-                    let data = arboard::ImageData {
-                        width: img.width() as usize,
-                        height: img.height() as usize,
-                        bytes: Cow::Owned(img.into_raw()),
-                    };
-                    cb.set_image(data).map_err(|e| anyhow!("set_image: {e}"))?;
-                }
-            }
-            Ok(())
-        })
-        .await
-        .context("clipboard task")??;
+        // arboard is blocking and its Clipboard isn't Send; do the whole op inside the
+        // blocking thread. The wrapper returns Err (never panics) if the clipboard fails.
+        tokio::task::spawn_blocking(move || clipboard::write(payload))
+            .await
+            .context("clipboard task")??;
 
         // Record what we wrote so echo-suppression (`on` mode) doesn't re-broadcast it.
         self.dedup.lock().unwrap().note_written(&hash);
@@ -620,6 +664,52 @@ impl Daemon {
         tokio::spawn(async move { d.handle_connection(conn).await });
         Ok(())
     }
+
+    /// Auto-connect loop: subscribe to room-scoped mDNS discovery and dial newly-found peers
+    /// with no ticket. To avoid opening the connection from both ends, only the peer with the
+    /// **larger** EndpointId dials; the other accepts the inbound. The ALPN still gates the
+    /// handshake, so a stray cross-room peer (should one ever share our service name) can't
+    /// complete the connection.
+    async fn run_discovery(self: Arc<Self>, mdns: MdnsAddressLookup, alpn: Vec<u8>) {
+        let my_id = self.endpoint.id();
+        let mut events = mdns.subscribe().await;
+        while let Some(ev) = events.next().await {
+            let DiscoveryEvent::Discovered { endpoint_info, .. } = ev else {
+                continue; // Expired / other: nothing to dial
+            };
+            let peer_id = endpoint_info.endpoint_id;
+            if peer_id == my_id {
+                continue; // ourselves
+            }
+            // Deterministic tie-break: only the larger id initiates.
+            if my_id < peer_id {
+                continue;
+            }
+            // Skip if already connected, or a dial to this peer is already in flight.
+            {
+                if self.peers.lock().unwrap().contains_key(&peer_id) {
+                    continue;
+                }
+                if !self.dialing.lock().unwrap().insert(peer_id) {
+                    continue;
+                }
+            }
+            let addr = endpoint_info.to_endpoint_addr();
+            let d = self.clone();
+            let alpn = alpn.clone();
+            tokio::spawn(async move {
+                let res = d.endpoint.connect(addr, &alpn).await;
+                d.dialing.lock().unwrap().remove(&peer_id);
+                match res {
+                    Ok(conn) => {
+                        tracing::info!("mDNS auto-connect -> {}", peer_id);
+                        d.handle_connection(conn).await;
+                    }
+                    Err(e) => tracing::debug!("mDNS auto-connect to {} failed: {e}", peer_id),
+                }
+            });
+        }
+    }
 }
 
 fn kind_matches(kind: RecvKind, env: &Envelope) -> bool {
@@ -652,6 +742,15 @@ fn describe(env: &Envelope) -> String {
 fn short_id(id: &EndpointId) -> String {
     let s = id.to_string();
     s.chars().take(12).collect()
+}
+
+/// mDNS service name scoped to a room, so different `--room`s don't discover each other.
+/// Folds the room secret into a DNS-SD-safe label (`clip` + 16 lowercase hex). The mDNS
+/// record becomes `<endpoint>._clip<hex>._udp.local`. (Belt-and-suspenders: the ALPN still
+/// enforces room isolation at the QUIC handshake — see `alpn_for_room`.)
+fn mdns_service_name(room: &str) -> String {
+    let h = blake3::hash(room.as_bytes());
+    format!("clip{}", hex::encode(&h.as_bytes()[..8]))
 }
 
 fn now_ms() -> u64 {

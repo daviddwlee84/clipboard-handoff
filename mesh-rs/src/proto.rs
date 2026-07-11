@@ -122,6 +122,8 @@ pub struct StatusInfo {
     pub room: String,
     pub transport: String,
     pub auto_copy: String,
+    /// `available` | `unavailable` — `unavailable` on a headless host (no display).
+    pub clipboard: String,
     pub peer_count: usize,
     pub buffer_len: usize,
 }
