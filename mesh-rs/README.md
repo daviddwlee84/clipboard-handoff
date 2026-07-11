@@ -121,26 +121,91 @@ real display-less host.
 
 | Command | Behavior |
 |---|---|
-| `clip daemon [--foreground]` | Run the resident daemon. |
-| `clip send [--text\|--image\|--auto]` | Read stdin to EOF, sniff type (PROTOCOL §2), broadcast. |
-| `clip recv [--follow] [--latest-image --emit-path] [--out PATH]` | Text→stdout; image→temp file, print path. `--follow` streams; otherwise returns the latest buffered item. |
-| `clip paste` | Write the latest received item to the OS clipboard (text→set_text, image→PNG→RGBA→set_image). |
+| `clip daemon [--foreground]` · `clip daemon stop` | Run / stop the resident daemon (`stop` applies `clear_on_exit`, §Sessions). |
+| `clip send [PATH] [--text\|--image\|--file\|--auto] [--name NAME]` | Read `PATH` (or stdin to EOF), sniff type (PROTOCOL §2), broadcast. An image/file carries its `filename` (from `PATH` or `--name`). |
+| `clip recv [--follow] [--latest-image --emit-path] [--out PATH]` | Text→stdout; image/file→blob-cache file, print path. `--follow` streams; otherwise returns the latest buffered item. |
+| `clip paste` | Write the latest received item to the OS clipboard (text→set_text, image→PNG→RGBA→set_image, **file → its path as text**). |
+| `clip clear [--all] [--yes]` | Clear this session's received data (§Sessions). |
 | `clip tui` | Messenger-style chat TUI attached to the daemon (see below). |
 | `clip pair --new [--json]` / `clip pair <ticket>` | Create / join a pairing. |
 | `clip peers` / `clip status [--json]` | Inspect peers / daemon state (`status` includes `clipboard: available\|unavailable`). |
 | `clip config set KEY VALUE` / `clip config get KEY` | Persist settings (SPEC §5). |
 
+### Sending an arbitrary file
+
+`image` is the only clipboard-pasteable binary type; **`file`** is arbitrary bytes with a
+best-effort mime (guessed from the extension, else `application/octet-stream`) and a `filename`.
+Sniffing (`--auto`, the default): PNG/JPEG magic → **image**; `--file` or a non-UTF-8 payload →
+**file**; valid UTF-8 → **text**.
+
+```sh
+clip send report.pdf                  # --auto: binary → file, filename=report.pdf
+clip send notes.txt --file            # force a file even though it is UTF-8 text
+tar cz dir | clip send --file --name dir.tgz   # stdin + an explicit name
+clip send shot.png                    # PNG magic → image (still clipboard-pasteable)
+```
+
+Image **and** file bytes ride the same path as before: a small hash-announce envelope is
+broadcast, each receiver **pulls** the bytes over a direct stream keyed by `blob.hash`,
+**BLAKE3-verifies** them, and materializes them into its blob cache — so `recv --emit-path` and
+`paste` always have a local path. `paste` of a `file` copies **that path** onto the clipboard as
+text (a file has no image clipboard form).
+
+### Sinks (SPEC §3) — where received items go
+
+Sinks are **additive**: an item can hit the clipboard *and* the folder/append-file.
+
+| Sink | Config key | Gets |
+|---|---|---|
+| clipboard | `auto_copy` | text, image (a `file` never lands on the clipboard automatically) |
+| folder | `save_dir` | image → `<filename\|hash>.png`, file → `<filename\|hash>` — de-duplicated as `name (2).ext` |
+| append-file | `text_file` | text, appended as `\n---\n<device> <ISO8601 ts>\n<text>\n` |
+
+```sh
+clip config set save_dir  ~/Downloads/clip
+clip config set text_file ~/notes/clip.md
+```
+
 ### Config keys (SPEC §5)
 
-`auto_copy` = `notify` (default) \| `on` \| `off` · `device_name` · `room` · `internet` · `broadcast_on_copy`.
+`auto_copy` = `notify` (default) \| `on` \| `off` · `save_dir` = path \| `""` · `text_file` = path \| `""` ·
+`clear_on_exit` = `ask` (default) \| `transient` \| `all` \| `never` · `device_name` · `room` · `internet` ·
+`broadcast_on_copy`.
 
 - **notify** (default): received items are buffered + a toast is emitted; the clipboard is **not**
-  touched. Use `clip paste` (or a TUI key, later) to place it.
+  touched. Use `clip paste` (or `y` in the TUI) to place it.
 - **on**: received items are written straight to the OS clipboard.
 - **off**: never touch the clipboard.
 
 Echo/loop suppression (SPEC §3): dedupe by `msg_id`; the daemon records the hash of what it last
-wrote to its own clipboard; received items are never re-broadcast.
+wrote to its own clipboard; received items are never re-broadcast. Sinks run **after** suppression.
+
+## Sessions & clearing (SPEC §8)
+
+A hand-off leaves data behind. The daemon tracks, per session (one daemon run): the **transient
+store** (`<config-dir>/blobs` — the fetched-blob cache *and* the `recv --emit-path` files — plus the
+in-memory buffer), the **`text_file` size at session start**, and the **`save_dir` files it wrote
+this session**. Clearing is therefore precise: it never touches pre-session content and never
+deletes a directory.
+
+| Scope | What it does |
+|---|---|
+| **transient** (always safe) | Empty the in-memory buffer + purge the blob cache / emit-path files. |
+| **all** (= transient + sinks) | Also truncate `text_file` back to its session-start offset and delete the `save_dir` files written this session. |
+
+```sh
+clip clear                 # transient
+clip clear --all           # + revert this session's sink writes (prompts unless --yes)
+clip clear --all --yes
+clip daemon stop           # applies clear_on_exit; SIGTERM does the same
+```
+
+`clear_on_exit` drives `daemon stop` / SIGTERM: `never` · `transient` · `all` · `ask` (prompt on a
+TTY, else fall back to `transient`). Quitting the **TUI** (`q` / `Ctrl-C`) after receiving anything
+raises the same choice inline: `⚑ clear this session? [t]ransient / [a]ll incl sinks / [n]o`.
+
+Verified end-to-end by `scripts/e2e_sinks.sh` (two daemons, sink writes hash-checked, then
+`clear --all --yes` reverts exactly this session's writes).
 
 ## Messenger TUI (`clip tui`)
 
@@ -165,10 +230,10 @@ Keybindings:
 | type + `Enter` | Send the line as a text item; it appears immediately as your own bubble. |
 | `Esc` | Toggle focus between the **composer** and **browse** mode. |
 | `↑` / `↓` (or `k` / `j` in browse) | Move the highlight over messages. |
-| `y` | Copy the highlighted (or latest) item to the OS clipboard **via the daemon**. |
-| `s` | Save the highlighted image to a file (`~/Downloads/clip-<hash>.png`, else the cwd). |
-| `o` | Open the highlighted image with the OS default app (`open`/`xdg-open`/`start`). |
-| `q` (browse) · `Ctrl-C` (any) | Quit, restoring the terminal. |
+| `y` | Copy the highlighted (or latest) item to the OS clipboard **via the daemon** (a `file` copies its path as text). |
+| `s` | Save the highlighted image/file to `~/Downloads/` (else the cwd). |
+| `o` | Open the highlighted image/file with the OS default app (`open`/`xdg-open`/`start`). |
+| `q` (browse) · `Ctrl-C` (any) | Quit. If anything was received this session, first ask `⚑ clear this session? [t]ransient / [a]ll incl sinks / [n]o` (SPEC §8), run that clear, then restore the terminal. |
 
 **Notify-first (respects `auto_copy`):** in the default `notify` mode the TUI does **not** touch the
 clipboard on receipt — incoming items surface with a subtle `● press y to copy` affordance and a
@@ -202,7 +267,8 @@ clip --config-dir /tmp/b --socket /tmp/b.sock --room demo paste    # -> pbpaste 
 
 - **Transport = iroh 1.0.2** (pinned exactly; the API churns). Phase 0 uses a minimal iroh
   `Endpoint` (preset `Minimal`, `RelayMode::Disabled`) + **direct QUIC** bidi streams carrying
-  CBOR envelopes; image bytes are **pulled by BLAKE3 hash** over a direct stream (never flooded).
+  CBOR envelopes; image **and file** bytes are **pulled by BLAKE3 hash** over a direct stream
+  (never flooded) and verified on receipt.
   Peers connect either via a copy-pasted **ticket** or via **LAN mDNS auto-discovery** (same
   `--room`, no ticket — see above), using the `iroh-mdns-address-lookup` companion crate (iroh
   1.0.2 renamed "discovery" to *address lookup*; the mDNS/swarm-discovery variant lives in that

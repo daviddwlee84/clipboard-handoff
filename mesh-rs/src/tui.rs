@@ -72,6 +72,12 @@ enum Body {
         blob: Blob,
         local_path: Option<String>,
     },
+    /// An arbitrary file: no thumbnail, no image clipboard form — `y` copies its path as text.
+    File {
+        blob: Blob,
+        filename: String,
+        local_path: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +107,9 @@ enum KeyOutcome {
     Copy,
     Save,
     Open,
+    /// Answer to the clear-on-quit prompt (SPEC §8): run this clear on the daemon, then exit.
+    /// `all` == transient + session sink writes; otherwise transient only.
+    ClearAndQuit { all: bool },
 }
 
 /// A composed line handed to the IO shell to broadcast; `seq` ties it back to its bubble.
@@ -128,6 +137,10 @@ pub struct App {
     toast: Option<(String, Instant)>,
     next_seq: u64,
     should_quit: bool,
+    /// Something was received this session → quitting asks whether to clear it (SPEC §8).
+    received_any: bool,
+    /// The clear-on-quit prompt is up and capturing keys.
+    quit_prompt: bool,
 }
 
 impl App {
@@ -142,6 +155,8 @@ impl App {
             toast: None,
             next_seq: 1,
             should_quit: false,
+            received_any: false,
+            quit_prompt: false,
         }
     }
 
@@ -180,18 +195,26 @@ impl App {
         } else {
             env.device_name.clone()
         };
+        let blank_blob = Blob {
+            hash: String::new(),
+            size: 0,
+            w: 0,
+            h: 0,
+        };
         let body = match env.typ {
             MsgType::Text => Body::Text(env.text.clone().unwrap_or_default()),
             MsgType::Image => Body::Image {
-                blob: env.blob.clone().unwrap_or(Blob {
-                    hash: String::new(),
-                    size: 0,
-                    w: 0,
-                    h: 0,
-                }),
+                blob: env.blob.clone().unwrap_or(blank_blob),
+                local_path,
+            },
+            MsgType::File => Body::File {
+                blob: env.blob.clone().unwrap_or(blank_blob),
+                filename: env.filename.clone().unwrap_or_else(|| "file".to_string()),
                 local_path,
             },
         };
+        // Anything received this session arms the clear-on-quit prompt (SPEC §8).
+        self.received_any |= !mine;
         let notify = self.header.auto_copy == "notify";
         let desc = describe(&env);
         self.messages.push(Message {
@@ -325,6 +348,19 @@ impl App {
         false
     }
 
+    // ---- quit (SPEC §8) --------------------------------------------------
+
+    /// `q`/Ctrl-C: if anything was received this session, raise the clear prompt instead of
+    /// quitting outright; otherwise quit straight away.
+    fn request_quit(&mut self) -> KeyOutcome {
+        if self.received_any {
+            self.quit_prompt = true;
+            KeyOutcome::Redraw
+        } else {
+            KeyOutcome::Quit
+        }
+    }
+
     // ---- key handling ----------------------------------------------------
 
     fn handle_key(&mut self, ev: &CtEvent) -> KeyOutcome {
@@ -335,8 +371,17 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return KeyOutcome::None;
         }
+        // The clear-on-quit prompt (SPEC §8) captures every key until it is answered.
+        if self.quit_prompt {
+            return match key.code {
+                KeyCode::Char('t') => KeyOutcome::ClearAndQuit { all: false },
+                KeyCode::Char('a') => KeyOutcome::ClearAndQuit { all: true },
+                KeyCode::Char('n') | KeyCode::Esc => KeyOutcome::Quit, // keep everything
+                _ => KeyOutcome::None,
+            };
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return KeyOutcome::Quit;
+            return self.request_quit();
         }
 
         match self.focus {
@@ -371,7 +416,7 @@ impl App {
                     self.focus = Focus::Compose;
                     KeyOutcome::Redraw
                 }
-                KeyCode::Char('q') => KeyOutcome::Quit,
+                KeyCode::Char('q') => self.request_quit(),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.select_up();
                     KeyOutcome::Redraw
@@ -577,6 +622,11 @@ async fn event_loop(
             Some(ev) = key_rx.recv() => {
                 match app.handle_key(&ev) {
                     KeyOutcome::Quit => app.should_quit = true,
+                    // Run the same clear the CLI's `clip clear [--all]` runs, then exit (SPEC §8).
+                    KeyOutcome::ClearAndQuit { all } => {
+                        let _ = request(paths, Req::Clear { all }).await;
+                        app.should_quit = true;
+                    }
                     KeyOutcome::Send(o) => spawn_send(paths, &cmd_tx, o),
                     KeyOutcome::Copy => do_copy(&mut app, paths, &cmd_tx),
                     KeyOutcome::Save => do_save(&mut app, paths, &cmd_tx),
@@ -647,6 +697,7 @@ fn spawn_send(paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdResult>, o: Outgo
             Req::Send {
                 kind: SniffKind::Text,
                 bytes: ByteBuf::from(o.text.into_bytes()),
+                filename: None,
             },
         )
         .await;
@@ -693,21 +744,32 @@ fn do_save(app: &mut App, _paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdResu
         app.set_toast("nothing selected".to_string());
         return;
     };
-    let (hash, src) = match &m.body {
+    let (hash, src, name) = match &m.body {
         Body::Image {
             blob,
             local_path: Some(p),
-        } => (blob.hash.clone(), p.clone()),
-        Body::Image { .. } => {
-            app.set_toast("image not downloaded yet".to_string());
+        } => (blob.hash.clone(), p.clone(), None),
+        Body::File {
+            blob,
+            filename,
+            local_path: Some(p),
+        } => (blob.hash.clone(), p.clone(), Some(filename.clone())),
+        Body::Image { .. } | Body::File { .. } => {
+            app.set_toast("not downloaded yet".to_string());
             return;
         }
         Body::Text(_) => {
-            app.set_toast("not an image (s only saves images)".to_string());
+            app.set_toast("not a file (s only saves images/files)".to_string());
             return;
         }
     };
-    let dest = save_dest(&hash);
+    let dest = match name {
+        Some(n) => {
+            let dir = save_dest(&hash);
+            dir.with_file_name(n)
+        }
+        None => save_dest(&hash),
+    };
     let tx = cmd_tx.clone();
     tokio::spawn(async move {
         let dest_str = dest.display().to_string();
@@ -731,13 +793,17 @@ fn do_open(app: &mut App, _paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdResu
         Body::Image {
             local_path: Some(p),
             ..
+        }
+        | Body::File {
+            local_path: Some(p),
+            ..
         } => p.clone(),
-        Body::Image { .. } => {
-            app.set_toast("image not downloaded yet".to_string());
+        Body::Image { .. } | Body::File { .. } => {
+            app.set_toast("not downloaded yet".to_string());
             return;
         }
         Body::Text(_) => {
-            app.set_toast("not an image (o only opens images)".to_string());
+            app.set_toast("not a file (o only opens images/files)".to_string());
             return;
         }
     };
@@ -999,6 +1065,22 @@ fn build_lines(app: &App, width: usize, now: u64) -> (Vec<Line<'static>>, Vec<Bl
                 }
                 img = Some(m.msg_id.clone());
             }
+            // A file has no visual form: a one-line card (name · size), `y` copies its path.
+            Body::File {
+                blob,
+                filename,
+                local_path,
+            } => {
+                let caption = format!("📄 {} · {}", filename, human_size(blob.size));
+                let mut l = Line::from(Span::raw(caption).blue());
+                if m.mine {
+                    l = l.right_aligned();
+                }
+                lines.push(l);
+                if let Some(p) = local_path {
+                    lines.push(Line::from(Span::raw(format!("   {p}")).dim()));
+                }
+            }
         }
 
         // Blank spacer between bubbles.
@@ -1039,7 +1121,14 @@ fn render_composer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_hint(f: &mut Frame, app: &App, area: Rect) {
-    let line = if let Some((t, _)) = &app.toast {
+    let line = if app.quit_prompt {
+        // SPEC §8: the TUI quit prompt.
+        Line::from(
+            Span::raw(" ⚑ clear this session? [t]ransient / [a]ll incl sinks / [n]o")
+                .yellow()
+                .bold(),
+        )
+    } else if let Some((t, _)) = &app.toast {
         Line::from(Span::raw(format!(" {t}")).yellow().bold())
     } else {
         Line::from(
@@ -1153,6 +1242,11 @@ fn describe(env: &Envelope) -> String {
             let (w, h) = env.blob.as_ref().map(|b| (b.w, b.h)).unwrap_or((0, 0));
             format!("image from {who} ({w}×{h})")
         }
+        MsgType::File => {
+            let size = env.blob.as_ref().map(|b| b.size).unwrap_or(0);
+            let name = env.filename.clone().unwrap_or_else(|| "file".into());
+            format!("file from {who} ({name} · {})", human_size(size))
+        }
     }
 }
 
@@ -1236,6 +1330,7 @@ mod tests {
             sender: sender.into(),
             device_name: "peer-box".into(),
             ts: now_ms(),
+            filename: None,
             text: Some(text.into()),
             blob: None,
         }
@@ -1325,6 +1420,7 @@ mod tests {
             sender: "PEERID".into(),
             device_name: "peer-box".into(),
             ts: now_ms(),
+            filename: Some("shot.png".into()),
             text: None,
             blob: Some(Blob {
                 hash: "abc123".into(),
@@ -1411,10 +1507,49 @@ mod tests {
             app.handle_key(&key(KeyCode::Esc, KeyModifiers::NONE)),
             KeyOutcome::Redraw
         );
-        // …and now `q` quits (in compose mode it would be a literal character).
+        // …and now `q` quits (in compose mode it would be a literal character). Something was
+        // received, so it first raises the clear-on-quit prompt (SPEC §8); `n` = quit, keep all.
+        assert_eq!(
+            app.handle_key(&key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            KeyOutcome::Redraw
+        );
+        assert!(app.quit_prompt);
+        assert_eq!(
+            app.handle_key(&key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            KeyOutcome::Quit
+        );
+    }
+
+    /// SPEC §8: quitting the TUI after receiving something prompts [t]/[a]/[n]; `t` clears the
+    /// transient store, `a` also reverts session sink writes. With nothing received, `q` just quits.
+    #[test]
+    fn quit_prompt_offers_transient_and_all_clears() {
+        let mut app = test_app();
+        app.focus = Focus::Browse;
+        // Nothing received yet → no prompt.
         assert_eq!(
             app.handle_key(&key(KeyCode::Char('q'), KeyModifiers::NONE)),
             KeyOutcome::Quit
+        );
+        assert!(!app.quit_prompt);
+
+        app.apply_event(Event::Item {
+            envelope: text_env("PEERID", "hi"),
+            local_path: None,
+        });
+        assert!(app.received_any);
+        assert_eq!(
+            app.handle_key(&key(KeyCode::Char('q'), KeyModifiers::NONE)),
+            KeyOutcome::Redraw
+        );
+        assert!(app.quit_prompt, "prompt must be up once something was received");
+        assert_eq!(
+            app.handle_key(&key(KeyCode::Char('t'), KeyModifiers::NONE)),
+            KeyOutcome::ClearAndQuit { all: false }
+        );
+        assert_eq!(
+            app.handle_key(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            KeyOutcome::ClearAndQuit { all: true }
         );
     }
 

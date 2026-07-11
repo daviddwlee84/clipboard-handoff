@@ -47,3 +47,7 @@ ratatui = "0.29"
 ratatui-image = { version = "=9.0.0", default-features = false, features = ["crossterm", "image-defaults"] }
 tui-textarea = "0.7.0"
 crossterm = { version = "0.28", features = ["event-stream"] }
+
+[dev-dependencies]
+# Temp dirs for the sink/session (SPEC §3/§8) unit tests.
+tempfile = "3"

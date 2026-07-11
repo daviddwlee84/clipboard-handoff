@@ -27,6 +27,10 @@ pub struct Envelope {
     pub sender: String,      // stable peer identity (iroh EndpointId hex)
     pub device_name: String, // advisory
     pub ts: u64,             // unix ms at sender
+    /// image/file: original file name, advisory (folder/save sinks). Optional + skipped when
+    /// unset, so an older peer that doesn't know this field still decodes the envelope.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub filename: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -38,14 +42,20 @@ pub struct Envelope {
 pub enum MsgType {
     Text,
     Image,
+    /// Arbitrary bytes: content-addressed like an image, but never clipboard-pasteable as an
+    /// image — it lands in the folder sink / `recv --emit-path` (PROTOCOL §1).
+    File,
 }
 
-/// A content-addressed image reference. Image bytes are always PNG on the wire.
+/// A content-addressed blob reference (image PNG bytes, or arbitrary file bytes).
+/// `w`/`h` are meaningful for images only (0 for files).
 #[derive(Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct Blob {
-    pub hash: String, // BLAKE3 hex of the PNG bytes — the integrity check
+    pub hash: String, // BLAKE3 hex of the bytes — the integrity check
     pub size: u64,
+    #[serde(default)]
     pub w: u32,
+    #[serde(default)]
     pub h: u32,
 }
 
@@ -72,6 +82,7 @@ pub enum SniffKind {
     Auto,
     Text,
     Image,
+    File,
 }
 
 #[derive(Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -83,7 +94,23 @@ pub enum RecvKind {
 
 #[derive(Serialize, serde::Deserialize, Debug)]
 pub enum Req {
-    Send { kind: SniffKind, bytes: ByteBuf },
+    Send {
+        kind: SniffKind,
+        bytes: ByteBuf,
+        /// image/file: the original name (from `PATH` or `--name`).
+        #[serde(default)]
+        filename: Option<String>,
+    },
+    /// `clip clear [--all]` (SPEC §8): transient always; `all` also reverts session sink writes.
+    Clear {
+        all: bool,
+    },
+    /// `clip daemon stop` (SPEC §8). `scope` is the clear scope the client resolved from
+    /// `clear_on_exit` (prompting on a TTY for `ask`); `None` = let the daemon resolve it.
+    DaemonStop {
+        #[serde(default)]
+        scope: Option<String>,
+    },
     RecvLatest { kind: RecvKind },
     Paste,
     /// Copy a *specific* buffered item (by ULID) to the OS clipboard. Used by the TUI's `y`
@@ -211,28 +238,65 @@ pub fn is_jpeg(b: &[u8]) -> bool {
     b.len() >= 3 && b[..3] == JPEG_MAGIC
 }
 
-/// The canonical result of sniffing: text, or PNG image bytes (the canonical wire format).
+/// The canonical result of sniffing: text, PNG image bytes (the canonical wire format), or
+/// arbitrary file bytes with a best-effort mime.
 pub enum Sniffed {
     Text(String),
     /// PNG bytes, decoded dimensions.
     Image { png: Vec<u8>, w: u32, h: u32 },
+    /// Arbitrary bytes + best-effort mime (from the extension, else application/octet-stream).
+    File { bytes: Vec<u8>, mime: String },
 }
 
-/// Sniff/normalize stdin bytes per PROTOCOL §2. JPEG is transcoded to PNG.
-pub fn sniff(kind: SniffKind, bytes: &[u8]) -> Result<Sniffed> {
+pub const MIME_OCTET: &str = "application/octet-stream";
+
+/// Best-effort mime for a file, guessed from its extension (PROTOCOL §1).
+pub fn mime_for_filename(name: Option<&str>) -> String {
+    let ext = name
+        .and_then(|n| std::path::Path::new(n).extension())
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "txt" | "log" | "md" => "text/plain; charset=utf-8",
+        "json" => "application/json",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        _ => MIME_OCTET,
+    }
+    .to_string()
+}
+
+/// Sniff/normalize send bytes per PROTOCOL §2. JPEG is transcoded to PNG; binary (or `--file`)
+/// becomes a `file`. Never errors on arbitrary binary — that *is* a valid file.
+pub fn sniff(kind: SniffKind, bytes: &[u8], filename: Option<&str>) -> Result<Sniffed> {
+    let as_file = || Sniffed::File {
+        bytes: bytes.to_vec(),
+        mime: mime_for_filename(filename),
+    };
     match kind {
         SniffKind::Text => {
             let s = std::str::from_utf8(bytes).context("--text: input is not valid UTF-8")?;
             Ok(Sniffed::Text(s.to_string()))
         }
         SniffKind::Image => to_png_sniffed(bytes),
+        SniffKind::File => Ok(as_file()),
         SniffKind::Auto => {
             if is_png(bytes) || is_jpeg(bytes) {
                 to_png_sniffed(bytes)
             } else if let Ok(s) = std::str::from_utf8(bytes) {
                 Ok(Sniffed::Text(s.to_string()))
             } else {
-                bail!("could not sniff type: not PNG/JPEG and not valid UTF-8")
+                Ok(as_file())
             }
         }
     }
@@ -339,6 +403,7 @@ mod tests {
             sender: "abcdef".into(),
             device_name: "laptop".into(),
             ts: 1_720_000_000_000,
+            filename: Some("shot.png".into()),
             text: None,
             blob: Some(Blob {
                 hash: "deadbeef".into(),
@@ -383,7 +448,7 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
         assert!(is_png(&png));
-        match sniff(SniffKind::Auto, &png).unwrap() {
+        match sniff(SniffKind::Auto, &png, None).unwrap() {
             Sniffed::Image { w, h, png: out } => {
                 assert_eq!((w, h), (1, 1));
                 assert!(is_png(&out));
@@ -401,7 +466,7 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
             .unwrap();
         assert!(is_jpeg(&jpg));
-        match sniff(SniffKind::Auto, &jpg).unwrap() {
+        match sniff(SniffKind::Auto, &jpg, None).unwrap() {
             Sniffed::Image { png, .. } => assert!(is_png(&png), "jpeg should transcode to png"),
             _ => panic!("expected image"),
         }
@@ -409,17 +474,68 @@ mod tests {
 
     #[test]
     fn sniff_utf8_text() {
-        match sniff(SniffKind::Auto, "hello".as_bytes()).unwrap() {
+        match sniff(SniffKind::Auto, "hello".as_bytes(), None).unwrap() {
             Sniffed::Text(s) => assert_eq!(s, "hello"),
             _ => panic!("expected text"),
         }
     }
 
+    /// PROTOCOL §2: binary with no `--file` still becomes a *file* (octet-stream), never an error.
     #[test]
-    fn sniff_rejects_binary_garbage() {
-        // invalid UTF-8, not an image
+    fn sniff_binary_becomes_file() {
         let junk = [0xff, 0xfe, 0x00, 0x01, 0x80];
-        assert!(sniff(SniffKind::Auto, &junk).is_err());
+        match sniff(SniffKind::Auto, &junk, None).unwrap() {
+            Sniffed::File { bytes, mime } => {
+                assert_eq!(bytes, junk);
+                assert_eq!(mime, MIME_OCTET);
+            }
+            _ => panic!("expected file"),
+        }
+    }
+
+    /// `--file` forces a file even for UTF-8 text, and the mime is guessed from the name.
+    #[test]
+    fn sniff_force_file_and_mime_from_extension() {
+        match sniff(SniffKind::File, b"id,name\n1,a\n", Some("rows.csv")).unwrap() {
+            Sniffed::File { mime, .. } => assert_eq!(mime, "text/csv"),
+            _ => panic!("expected file"),
+        }
+        // PNG magic still wins over --auto; but --file on binary with an unknown ext → octet.
+        match sniff(SniffKind::File, &[0x00, 0xff], Some("blob.weird")).unwrap() {
+            Sniffed::File { mime, .. } => assert_eq!(mime, MIME_OCTET),
+            _ => panic!("expected file"),
+        }
+        assert_eq!(mime_for_filename(Some("a/b/report.pdf")), "application/pdf");
+        assert_eq!(mime_for_filename(None), MIME_OCTET);
+    }
+
+    /// A `file` envelope (type + filename + blob, no w/h) round-trips through the frame codec.
+    #[tokio::test]
+    async fn file_envelope_round_trips() {
+        let env = Envelope {
+            v: PROTO_V,
+            msg_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".into(),
+            typ: MsgType::File,
+            mime: MIME_OCTET.into(),
+            sender: "abcdef".into(),
+            device_name: "laptop".into(),
+            ts: 1_720_000_000_001,
+            filename: Some("payload.bin".into()),
+            text: None,
+            blob: Some(Blob {
+                hash: blake3_hex(b"payload"),
+                size: 7,
+                w: 0,
+                h: 0,
+            }),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &env).await.unwrap();
+        let mut cur = std::io::Cursor::new(buf);
+        let back: Envelope = read_frame(&mut cur).await.unwrap();
+        assert_eq!(env, back);
+        assert_eq!(back.typ, MsgType::File);
+        assert_eq!(back.filename.as_deref(), Some("payload.bin"));
     }
 
     #[test]

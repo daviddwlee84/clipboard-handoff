@@ -42,19 +42,38 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the resident daemon (normally auto-spawned).
+    /// Run the resident daemon (normally auto-spawned); `daemon stop` shuts it down.
     Daemon {
         #[arg(long)]
         foreground: bool,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
-    /// Read stdin to EOF, sniff type, and broadcast to peers.
+    /// Send PATH (or stdin to EOF): sniff type and broadcast to peers.
     Send {
+        /// File to send. Omit to read stdin.
+        path: Option<PathBuf>,
         #[arg(long)]
         text: bool,
         #[arg(long)]
         image: bool,
+        /// Force an arbitrary-file item (never clipboard-pasteable; lands in `save_dir`).
+        #[arg(long)]
+        file: bool,
         #[arg(long)]
         auto: bool,
+        /// Advisory filename carried with an image/file item (defaults to PATH's base name).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Clear this session's received data (SPEC §8).
+    Clear {
+        /// Also revert this session's sink writes (text_file lines + save_dir files).
+        #[arg(long)]
+        all: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Receive items. Text -> stdout, image -> temp file path.
     Recv {
@@ -94,10 +113,16 @@ enum ConfigAction {
     Get { key: String },
 }
 
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Stop the resident daemon, applying `clear_on_exit` (SPEC §8).
+    Stop,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let is_daemon = matches!(cli.cmd, Cmd::Daemon { .. });
+    let is_daemon = matches!(cli.cmd, Cmd::Daemon { action: None, .. });
     init_tracing(cli.verbose, cli.quiet, is_daemon);
 
     let paths =
@@ -122,11 +147,22 @@ async fn main() {
 async fn dispatch(cli: Cli, paths: config::Paths) -> Result<i32> {
     let json = cli.json;
     match cli.cmd {
+        Cmd::Daemon { action: Some(DaemonAction::Stop), .. } => {
+            client::cmd_daemon_stop(&paths).await
+        }
         Cmd::Daemon { .. } => {
             daemon::run(paths).await?;
             Ok(0)
         }
-        Cmd::Send { text, image, auto } => client::cmd_send(&paths, text, image, auto).await,
+        Cmd::Send {
+            path,
+            text,
+            image,
+            file,
+            auto,
+            name,
+        } => client::cmd_send(&paths, path, text, image, file, auto, name).await,
+        Cmd::Clear { all, yes } => client::cmd_clear(&paths, all, yes).await,
         Cmd::Recv {
             follow,
             latest_image,

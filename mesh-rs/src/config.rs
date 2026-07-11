@@ -42,6 +42,11 @@ impl Paths {
     pub fn config_path(&self) -> PathBuf {
         self.config_dir.join("config.json")
     }
+    /// The transient store: the fetched-blob cache + `recv --emit-path` temp files (SPEC §8).
+    /// Lives under the config dir so `clear` can purge exactly this daemon's data.
+    pub fn blob_dir(&self) -> PathBuf {
+        self.config_dir.join("blobs")
+    }
 
     pub fn ensure_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)
@@ -104,6 +109,10 @@ impl ConfigStore {
         }
         match key {
             "auto_copy" => Some("notify".into()),
+            // Sinks (SPEC §3/§5): unset == "" == disabled.
+            "save_dir" => Some(String::new()),
+            "text_file" => Some(String::new()),
+            "clear_on_exit" => Some("ask".into()),
             "internet" => Some("off".into()),
             "broadcast_on_copy" => Some("off".into()),
             "device_name" => Some(default_device_name()),
@@ -113,6 +122,14 @@ impl ConfigStore {
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
+        if key == "clear_on_exit"
+            && !matches!(value, "ask" | "transient" | "all" | "never")
+        {
+            anyhow::bail!("clear_on_exit must be one of: ask|transient|all|never");
+        }
+        if key == "auto_copy" && !matches!(value, "notify" | "on" | "off") {
+            anyhow::bail!("auto_copy must be one of: notify|on|off");
+        }
         self.map.insert(key.to_string(), value.to_string());
         let s = serde_json::to_string_pretty(&self.map)?;
         std::fs::write(&self.path, s).with_context(|| format!("write {}", self.path.display()))?;
@@ -121,6 +138,18 @@ impl ConfigStore {
 
     pub fn auto_copy(&self) -> String {
         self.get("auto_copy").unwrap_or_else(|| "notify".into())
+    }
+    /// Folder sink (SPEC §3): received image/file items land here. "" = disabled.
+    pub fn save_dir(&self) -> String {
+        self.get("save_dir").unwrap_or_default()
+    }
+    /// Append sink (SPEC §3): received text is appended here. "" = disabled.
+    pub fn text_file(&self) -> String {
+        self.get("text_file").unwrap_or_default()
+    }
+    /// Session-end policy (SPEC §8).
+    pub fn clear_on_exit(&self) -> String {
+        self.get("clear_on_exit").unwrap_or_else(|| "ask".into())
     }
 }
 

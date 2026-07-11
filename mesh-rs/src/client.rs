@@ -2,7 +2,7 @@
 //! subcommands. They hold no network state and auto-spawn the daemon if absent.
 
 use std::{
-    io::Read,
+    io::{IsTerminal, Read, Write},
     path::PathBuf,
     process::Stdio,
     time::Duration,
@@ -66,18 +66,48 @@ pub(crate) async fn request(paths: &Paths, req: Req) -> Result<Resp> {
 // Subcommands. Each returns a process exit code (SPEC §2 exit codes).
 // ---------------------------------------------------------------------------
 
-pub async fn cmd_send(paths: &Paths, text: bool, image: bool, _auto: bool) -> Result<i32> {
+/// `clip send [PATH] [--text|--image|--file|--auto] [--name NAME]` (SPEC §2). Reads `PATH` (or
+/// stdin to EOF); `filename` comes from `--name`, else from `PATH`.
+pub async fn cmd_send(
+    paths: &Paths,
+    path: Option<PathBuf>,
+    text: bool,
+    image: bool,
+    file: bool,
+    _auto: bool,
+    name: Option<String>,
+) -> Result<i32> {
     let kind = if text {
         SniffKind::Text
     } else if image {
         SniffKind::Image
+    } else if file {
+        SniffKind::File
     } else {
         SniffKind::Auto
     };
     let mut buf = Vec::new();
-    std::io::stdin().lock().read_to_end(&mut buf)?;
+    match &path {
+        Some(p) => buf = std::fs::read(p).map_err(|e| anyhow::anyhow!("read {}: {e}", p.display()))?,
+        None => {
+            std::io::stdin().lock().read_to_end(&mut buf)?;
+        }
+    }
+    let filename = name.or_else(|| {
+        path.as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    });
 
-    let resp = match request(paths, Req::Send { kind, bytes: ByteBuf::from(buf) }).await {
+    let resp = match request(
+        paths,
+        Req::Send {
+            kind,
+            bytes: ByteBuf::from(buf),
+            filename,
+        },
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("clip send: cannot reach daemon: {e:#}");
@@ -168,8 +198,10 @@ fn emit_item(env: &Envelope, local_path: Option<&str>, out: Option<&std::path::P
         MsgType::Text => {
             println!("{}", env.text.clone().unwrap_or_default());
         }
-        MsgType::Image => {
-            let src = local_path.ok_or_else(|| anyhow::anyhow!("image bytes not yet available"))?;
+        // Image and file both materialize as a local file in the daemon's blob cache; `--out`
+        // copies it out, otherwise we print the cache path (`--emit-path`).
+        MsgType::Image | MsgType::File => {
+            let src = local_path.ok_or_else(|| anyhow::anyhow!("blob bytes not yet available"))?;
             let final_path = if let Some(o) = out {
                 std::fs::copy(src, o)?;
                 o.to_path_buf()
@@ -201,6 +233,103 @@ pub async fn cmd_paste(paths: &Paths) -> Result<i32> {
             Ok(code)
         }
     }
+}
+
+/// `clip clear [--all] [--yes]` (SPEC §8). Transient by default; `--all` also reverts this
+/// session's sink writes and prompts first (unless `--yes`, or there is no TTY to prompt on).
+pub async fn cmd_clear(paths: &Paths, all: bool, yes: bool) -> Result<i32> {
+    if all && !yes {
+        if !std::io::stdin().is_terminal() {
+            eprintln!("clip clear: --all needs --yes when not attached to a terminal");
+            return Ok(2);
+        }
+        if !confirm("clear this session incl. sink writes (text_file lines + save_dir files)? [y/N] ")? {
+            eprintln!("clip clear: aborted");
+            return Ok(0);
+        }
+    }
+    let resp = match request(paths, Req::Clear { all }).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("clip clear: cannot reach daemon: {e:#}");
+            return Ok(3);
+        }
+    };
+    match resp {
+        Resp::Ok(_) => {
+            eprintln!(
+                "cleared: {}",
+                if all { "transient + session sinks" } else { "transient" }
+            );
+            Ok(0)
+        }
+        Resp::Err { code, message } => {
+            eprintln!("clip clear: {message}");
+            Ok(code)
+        }
+    }
+}
+
+/// `clip daemon stop` (SPEC §8): resolve `clear_on_exit` (prompting on a TTY for `ask`, else
+/// falling back to `transient`), then ask the daemon to apply that scope and shut down.
+pub async fn cmd_daemon_stop(paths: &Paths) -> Result<i32> {
+    let policy = match request(paths, Req::ConfigGet { key: "clear_on_exit".into() }).await {
+        Ok(Resp::Ok(OkData::Config(Some(v)))) => v,
+        Ok(_) => "ask".to_string(),
+        Err(e) => {
+            eprintln!("clip daemon stop: cannot reach daemon: {e:#}");
+            return Ok(3);
+        }
+    };
+    let scope = if policy == "ask" {
+        if std::io::stdin().is_terminal() {
+            prompt_scope()?
+        } else {
+            "transient".to_string() // no TTY: non-interactive fallback (SPEC §8)
+        }
+    } else {
+        policy
+    };
+
+    let resp = match request(paths, Req::DaemonStop { scope: Some(scope.clone()) }).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("clip daemon stop: cannot reach daemon: {e:#}");
+            return Ok(3);
+        }
+    };
+    match resp {
+        Resp::Ok(_) => {
+            eprintln!("daemon stopped (clear: {scope})");
+            Ok(0)
+        }
+        Resp::Err { code, message } => {
+            eprintln!("clip daemon stop: {message}");
+            Ok(code)
+        }
+    }
+}
+
+/// The interactive `clear_on_exit: ask` prompt (same choices as the TUI quit prompt, SPEC §8).
+fn prompt_scope() -> Result<String> {
+    eprint!("clear this session? [t]ransient / [a]ll incl sinks / [n]o: ");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(match line.trim().to_lowercase().chars().next() {
+        Some('a') => "all",
+        Some('n') => "never",
+        _ => "transient",
+    }
+    .to_string())
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 pub async fn cmd_pair(

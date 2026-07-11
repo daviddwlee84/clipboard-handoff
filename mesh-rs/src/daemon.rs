@@ -4,6 +4,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -66,6 +67,221 @@ pub struct Daemon {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     dedup: Mutex<Dedup>,
     events: broadcast::Sender<Event>,
+    /// What this session has fetched/written, so `clear` (SPEC §8) can revert precisely.
+    session: Mutex<Session>,
+    /// Signals the accept loop to shut down (`daemon stop` / SIGTERM).
+    stop: Arc<tokio::sync::Notify>,
+    /// The clear scope a `daemon stop` client already resolved+applied (so the shutdown path
+    /// doesn't re-derive one from `clear_on_exit`). `None` on SIGTERM.
+    stop_scope: Mutex<Option<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// Session & sinks (SPEC §3 / §8)
+// ---------------------------------------------------------------------------
+
+/// Records what this daemon run wrote, so `clear --all` can revert exactly this session:
+/// the `text_file`'s size when it became the sink (the truncation offset) and the files
+/// written into `save_dir`. The transient store (blob dir + ring) is purged wholesale.
+#[derive(Debug, Default)]
+pub struct Session {
+    text_file: String,
+    text_offset: u64,
+    saved: Vec<PathBuf>,
+    /// True once anything was received this session (drives the TUI quit prompt).
+    pub received_any: bool,
+}
+
+impl Session {
+    /// Capture the session-start offset for a `text_file` sink. Re-captured when the sink is
+    /// (re)configured mid-session via `config set text_file`, so a later `clear --all` only
+    /// removes what *this* session appended to *that* file.
+    pub fn set_text_file(&mut self, path: &str) {
+        if path == self.text_file {
+            return;
+        }
+        self.text_file = path.to_string();
+        self.text_offset = if path.is_empty() { 0 } else { file_size(Path::new(path)) };
+    }
+}
+
+fn file_size(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Fan a received item out to the additive folder/append-file sinks (SPEC §3). Independent of
+/// (and additive to) the clipboard sink. `bytes` are the verified blob bytes for image/file.
+pub fn route_sinks(
+    session: &Mutex<Session>,
+    save_dir: &str,
+    text_file: &str,
+    env: &Envelope,
+    bytes: Option<&[u8]>,
+) {
+    match env.typ {
+        MsgType::Text => {
+            if !text_file.is_empty() {
+                append_text_sink(session, text_file, env);
+            }
+        }
+        MsgType::Image | MsgType::File => {
+            if !save_dir.is_empty() {
+                if let Some(b) = bytes {
+                    write_save_dir(session, Path::new(save_dir), &sink_name(env), b);
+                }
+            }
+        }
+    }
+}
+
+/// The save_dir name for an item: its `filename` if present, else `<hash>` (with `.png` forced
+/// for images, which are always PNG on the wire).
+pub fn sink_name(env: &Envelope) -> String {
+    let hash = env.blob.as_ref().map(|b| b.hash.clone()).unwrap_or_default();
+    let base = env
+        .filename
+        .as_deref()
+        .map(|f| {
+            Path::new(f)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| f.to_string())
+        })
+        .filter(|f| !f.is_empty());
+    match env.typ {
+        MsgType::Image => {
+            let name = base.unwrap_or(hash);
+            let stem = Path::new(&name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or(name);
+            format!("{stem}.png")
+        }
+        _ => base.unwrap_or_else(|| if hash.is_empty() { "file".into() } else { hash }),
+    }
+}
+
+/// Write `data` into `dir` under `name`, de-duplicating on collision (`name (2).ext`), and record
+/// the path as a this-session write (SPEC §8).
+fn write_save_dir(session: &Mutex<Session>, dir: &Path, name: &str, data: &[u8]) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!("save_dir: mkdir {}: {e}", dir.display());
+        return;
+    }
+    let path = dedup_path(dir, name);
+    if let Err(e) = std::fs::write(&path, data) {
+        tracing::warn!("save_dir: write {}: {e}", path.display());
+        return;
+    }
+    session.lock().unwrap().saved.push(path.clone());
+    tracing::info!("wrote to save_dir: {} ({} bytes)", path.display(), data.len());
+}
+
+/// `dir/name`, or `dir/name (2).ext`, `dir/name (3).ext` … on collision (SPEC §3).
+pub fn dedup_path(dir: &Path, name: &str) -> PathBuf {
+    let name = if name.is_empty() { "file" } else { name };
+    let cand = dir.join(name);
+    if !cand.exists() {
+        return cand;
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let ext = p
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for i in 2.. {
+        let cand = dir.join(format!("{stem} ({i}){ext}"));
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    unreachable!()
+}
+
+/// Append a received text item to the append-file with the SPEC §3 header:
+/// `\n---\n<device> <ISO8601 ts>\n<text>\n`.
+fn append_text_sink(session: &Mutex<Session>, path: &str, env: &Envelope) {
+    // Anchor the truncation offset to this path before we grow it.
+    session.lock().unwrap().set_text_file(path);
+
+    let device = if env.device_name.is_empty() {
+        if env.sender.is_empty() { "peer".to_string() } else { short_str(&env.sender) }
+    } else {
+        env.device_name.clone()
+    };
+    let ts = iso8601(env.ts);
+    let entry = format!(
+        "\n---\n{device} {ts}\n{}\n",
+        env.text.clone().unwrap_or_default()
+    );
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(entry.as_bytes()) {
+                tracing::warn!("text_file: append {path}: {e}");
+            } else {
+                tracing::info!("appended to text_file: {path}");
+            }
+        }
+        Err(e) => tracing::warn!("text_file: open {path}: {e}"),
+    }
+}
+
+/// Revert this session's sink writes (SPEC §8): truncate `text_file` back to its session-start
+/// offset and delete the files written into `save_dir` this session. Never touches pre-session
+/// content, never removes a directory.
+pub fn clear_sinks(session: &Mutex<Session>) {
+    let (path, off, saved) = {
+        let mut s = session.lock().unwrap();
+        (s.text_file.clone(), s.text_offset, std::mem::take(&mut s.saved))
+    };
+    if !path.is_empty() && file_size(Path::new(&path)) > off {
+        if let Err(e) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_len(off))
+        {
+            tracing::warn!("clear: truncate {path}: {e}");
+        }
+    }
+    for f in &saved {
+        if let Err(e) = std::fs::remove_file(f) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("clear: remove {}: {e}", f.display());
+            }
+        }
+    }
+    tracing::info!(
+        "cleared session sinks (text_file {path:?} @ {off}, {} save_dir files)",
+        saved.len()
+    );
+}
+
+/// UTC ISO-8601 (RFC 3339, second precision) for a unix-ms timestamp.
+fn iso8601(ms: u64) -> String {
+    let ms = if ms == 0 { now_ms() } else { ms };
+    let secs = (ms / 1000) as i64;
+    // days-since-epoch → civil date (Howard Hinnant's algorithm), then h:m:s.
+    let (mut days, mut rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    rem = 0;
+    let _ = rem;
+    days += 719_468;
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn short_str(s: &str) -> String {
+    s.chars().take(12).collect()
 }
 
 /// iroh accept-side protocol handler: hands each incoming connection to the daemon.
@@ -140,6 +356,12 @@ pub async fn run(paths: Paths) -> Result<()> {
         .await
         .map_err(|e| anyhow!("iroh endpoint bind failed: {e}"))?;
 
+    // The transient store: fetched blobs + `recv --emit-path` temp files live here, so `clear`
+    // (SPEC §8) purges exactly this daemon's data and nothing else.
+    std::fs::create_dir_all(paths.blob_dir())?;
+    let mut session = Session::default();
+    session.set_text_file(&config.text_file());
+
     let (events, _rx) = broadcast::channel(256);
     let daemon = Arc::new(Daemon {
         paths: paths.clone(),
@@ -155,6 +377,9 @@ pub async fn run(paths: Paths) -> Result<()> {
         blobs: Mutex::new(HashMap::new()),
         dedup: Mutex::new(Dedup::new(4096)),
         events,
+        session: Mutex::new(session),
+        stop: Arc::new(tokio::sync::Notify::new()),
+        stop_scope: Mutex::new(None),
     });
 
     // Accept loop for inbound iroh connections (same-room ALPN only).
@@ -191,14 +416,58 @@ pub async fn run(paths: Paths) -> Result<()> {
         paths.socket.display()
     );
 
-    loop {
-        let stream = listener.accept().await?;
-        let d = daemon.clone();
+    // SIGTERM is a session end (SPEC §8): apply `clear_on_exit` non-interactively (a bare daemon
+    // has no TTY, so `ask` falls back to transient) and shut down cleanly.
+    let stop = daemon.stop.clone();
+    #[cfg(unix)]
+    {
+        let stop = stop.clone();
         tokio::spawn(async move {
-            if let Err(e) = d.handle_ipc(stream).await {
-                tracing::debug!("ipc handler error: {e:#}");
-            }
+            let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("SIGTERM handler unavailable: {e}");
+                    return;
+                }
+            };
+            sig.recv().await;
+            tracing::info!("SIGTERM received — shutting down");
+            stop.notify_waiters();
         });
+    }
+
+    loop {
+        tokio::select! {
+            _ = stop.notified() => break,
+            accepted = listener.accept() => {
+                let stream = accepted?;
+                let d = daemon.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = d.handle_ipc(stream).await {
+                        tracing::debug!("ipc handler error: {e:#}");
+                    }
+                });
+            }
+        }
+    }
+
+    // A `daemon stop` request already applied its resolved scope before signalling; a SIGTERM
+    // has not, so apply the configured policy here.
+    if daemon.stop_scope.lock().unwrap().is_none() {
+        let policy = daemon.config.lock().unwrap().clear_on_exit();
+        daemon.apply_clear_scope(&resolve_exit_scope(&policy));
+    }
+    let _ = std::fs::remove_file(&paths.socket);
+    tracing::info!("clip daemon stopped");
+    Ok(())
+}
+
+/// Map a `clear_on_exit` policy to a concrete scope for a non-interactive session end:
+/// `ask` → `transient` (SPEC §8).
+pub fn resolve_exit_scope(policy: &str) -> String {
+    match policy {
+        "ask" | "" => "transient".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -284,23 +553,26 @@ impl Daemon {
             bail!("unsupported protocol version {}", env.v);
         }
 
+        // Image AND file are content-addressed: pull the bytes over a direct stream keyed by
+        // hash, BLAKE3-verify them, and materialize them into the blob cache so `paste` and
+        // `recv --emit-path` always have a local path (PROTOCOL §1).
         let mut local_path = None;
-        if env.typ == MsgType::Image {
+        let mut bytes: Option<Vec<u8>> = None;
+        if matches!(env.typ, MsgType::Image | MsgType::File) {
             let blob = env
                 .blob
                 .clone()
-                .ok_or_else(|| anyhow!("image envelope missing blob ref"))?;
-            // Pull the PNG bytes over a direct stream, keyed by hash (PROTOCOL §1).
-            let bytes = self.fetch_blob(&conn, &blob.hash).await?;
-            let got = blake3_hex(&bytes);
+                .ok_or_else(|| anyhow!("{:?} envelope missing blob ref", env.typ))?;
+            let b = self.fetch_blob(&conn, &blob.hash).await?;
+            let got = blake3_hex(&b);
             if got != blob.hash {
                 bail!("blob hash mismatch (got {got}, want {})", blob.hash);
             }
-            self.blobs.lock().unwrap().insert(blob.hash.clone(), bytes.clone());
-            let short = &blob.hash[..blob.hash.len().min(16)];
-            let path = std::env::temp_dir().join(format!("clip-{short}.png"));
-            std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
+            self.blobs.lock().unwrap().insert(blob.hash.clone(), b.clone());
+            let path = self.blob_cache_path(&env, &blob.hash);
+            std::fs::write(&path, &b).with_context(|| format!("write {}", path.display()))?;
             local_path = Some(path.to_string_lossy().to_string());
+            bytes = Some(b);
         }
 
         {
@@ -313,6 +585,14 @@ impl Daemon {
                 ring.pop_front();
             }
         }
+        self.session.lock().unwrap().received_any = true;
+
+        // Additive sinks (SPEC §3): folder / append-file, independent of the clipboard.
+        let (save_dir, text_file) = {
+            let c = self.config.lock().unwrap();
+            (c.save_dir(), c.text_file())
+        };
+        route_sinks(&self.session, &save_dir, &text_file, &env, bytes.as_deref());
 
         // Auto-copy behavior (SPEC §3). Default = notify (never touch the clipboard).
         let mode = self.config.lock().unwrap().auto_copy();
@@ -386,8 +666,9 @@ impl Daemon {
     async fn handle_ipc(self: Arc<Self>, mut stream: IpcStream) -> Result<()> {
         let req: Req = read_frame(&mut stream).await?;
         match req {
-            Req::Send { kind, bytes } => {
-                let resp = match sniff(kind, &bytes) {
+            Req::Send { kind, bytes, filename } => {
+                let name = filename.as_deref().map(base_name);
+                let resp = match sniff(kind, &bytes, name.as_deref()) {
                     Ok(Sniffed::Text(text)) => {
                         let mut env = self.base_envelope(MsgType::Text, "text/plain; charset=utf-8");
                         env.text = Some(text);
@@ -399,11 +680,27 @@ impl Daemon {
                         let hash = blake3_hex(&png);
                         self.blobs.lock().unwrap().insert(hash.clone(), png.clone());
                         let mut env = self.base_envelope(MsgType::Image, "image/png");
+                        env.filename = name;
                         env.blob = Some(Blob {
                             hash,
                             size: png.len() as u64,
                             w,
                             h,
+                        });
+                        let n = self.broadcast(&env).await;
+                        self.record_sent(&env, None);
+                        Resp::Ok(OkData::Sent { msg_id: env.msg_id, reached: n })
+                    }
+                    Ok(Sniffed::File { bytes, mime }) => {
+                        let hash = blake3_hex(&bytes);
+                        self.blobs.lock().unwrap().insert(hash.clone(), bytes.clone());
+                        let mut env = self.base_envelope(MsgType::File, &mime);
+                        env.filename = name;
+                        env.blob = Some(Blob {
+                            hash,
+                            size: bytes.len() as u64,
+                            w: 0,
+                            h: 0,
                         });
                         let n = self.broadcast(&env).await;
                         self.record_sent(&env, None);
@@ -415,6 +712,21 @@ impl Daemon {
                     },
                 };
                 write_frame(&mut stream, &resp).await?;
+            }
+            Req::Clear { all } => {
+                self.apply_clear_scope(if all { "all" } else { "transient" });
+                write_frame(&mut stream, &Resp::Ok(OkData::None)).await?;
+            }
+            Req::DaemonStop { scope } => {
+                // The client resolved `clear_on_exit` (prompting on a TTY for `ask`); fall back
+                // to the config policy if it didn't (SPEC §8).
+                let scope = scope.unwrap_or_else(|| {
+                    resolve_exit_scope(&self.config.lock().unwrap().clear_on_exit())
+                });
+                self.apply_clear_scope(&scope);
+                *self.stop_scope.lock().unwrap() = Some(scope);
+                write_frame(&mut stream, &Resp::Ok(OkData::None)).await?;
+                self.stop.notify_waiters();
             }
             Req::RecvLatest { kind } => {
                 // Subscribe *before* checking the buffer to avoid missing an item
@@ -550,7 +862,14 @@ impl Daemon {
             }
             Req::ConfigSet { key, value } => {
                 let resp = match self.config.lock().unwrap().set(&key, &value) {
-                    Ok(()) => Resp::Ok(OkData::None),
+                    Ok(()) => {
+                        // Re-anchor the session truncation offset when the append sink changes
+                        // mid-session, so `clear --all` only removes what *we* appended (SPEC §8).
+                        if key == "text_file" {
+                            self.session.lock().unwrap().set_text_file(&value);
+                        }
+                        Resp::Ok(OkData::None)
+                    }
                     Err(e) => Resp::Err {
                         code: 1,
                         message: e.to_string(),
@@ -597,8 +916,59 @@ impl Daemon {
             sender: self.endpoint.id().to_string(),
             device_name: self.device_name.clone(),
             ts: now_ms(),
+            filename: None,
             text: None,
             blob: None,
+        }
+    }
+
+    /// Where a fetched blob is materialized in the transient store: `<blob_dir>/<hash><ext>`
+    /// (`.png` for images; the filename's extension for files). Content-addressed, so a repeat
+    /// of the same bytes reuses the same path.
+    fn blob_cache_path(&self, env: &Envelope, hash: &str) -> PathBuf {
+        let short: String = hash.chars().take(16).collect();
+        let ext = match env.typ {
+            MsgType::Image => ".png".to_string(),
+            _ => env
+                .filename
+                .as_deref()
+                .and_then(|f| Path::new(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
+                .unwrap_or_default(),
+        };
+        self.paths.blob_dir().join(format!("clip-{short}{ext}"))
+    }
+
+    // ---- clearing (SPEC §8) ----------------------------------------------
+
+    /// Purge the always-safe transient store: the in-memory received buffer, the fetched-blob
+    /// cache in memory, and the on-disk blob dir (which also holds `recv --emit-path` files).
+    fn clear_transient(&self) {
+        self.ring.lock().unwrap().clear();
+        self.blobs.lock().unwrap().clear();
+        self.sent.lock().unwrap().clear();
+        let dir = self.paths.blob_dir();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut n = 0;
+            for e in entries.flatten() {
+                if std::fs::remove_file(e.path()).is_ok() {
+                    n += 1;
+                }
+            }
+            tracing::info!("cleared transient store (buffer emptied, {n} blobs removed)");
+        }
+        self.session.lock().unwrap().received_any = false;
+    }
+
+    /// Run a concrete clear scope: `never` | `transient` | `all`.
+    pub fn apply_clear_scope(&self, scope: &str) {
+        match scope {
+            "all" => {
+                self.clear_transient();
+                clear_sinks(&self.session);
+            }
+            "transient" => self.clear_transient(),
+            "never" | "" => {}
+            other => tracing::warn!("unknown clear scope {other:?}; keeping everything"),
         }
     }
 
@@ -650,27 +1020,11 @@ impl Daemon {
         if !self.clipboard_available {
             bail!("clipboard unavailable (headless) — send/recv/paste-to-file still work");
         }
-        let (hash, payload) = match env.typ {
-            MsgType::Text => {
-                let text = env.text.clone().unwrap_or_default();
-                (blake3_hex(text.as_bytes()), clipboard::Payload::Text(text))
-            }
-            MsgType::Image => {
-                let blob = env
-                    .blob
-                    .clone()
-                    .ok_or_else(|| anyhow!("image envelope missing blob"))?;
-                let bytes = self
-                    .blobs
-                    .lock()
-                    .unwrap()
-                    .get(&blob.hash)
-                    .cloned()
-                    .or_else(|| local_path.and_then(|p| std::fs::read(p).ok()))
-                    .ok_or_else(|| anyhow!("image bytes unavailable"))?;
-                (blob.hash.clone(), clipboard::Payload::ImagePng(bytes))
-            }
-        };
+        let cached = env
+            .blob
+            .as_ref()
+            .and_then(|b| self.blobs.lock().unwrap().get(&b.hash).cloned());
+        let (hash, payload) = clip_payload(env, local_path, cached)?;
 
         // arboard is blocking and its Clipboard isn't Send; do the whole op inside the
         // blocking thread. The wrapper returns Err (never panics) if the clipboard fails.
@@ -772,12 +1126,51 @@ impl Daemon {
     }
 }
 
+/// The OS-clipboard representation of an item, plus the content hash recorded for echo
+/// suppression (SPEC §3 rule 2). Text copies its text; an image copies PNG bytes; a **file** has
+/// no image clipboard form, so it copies its **local path as text** (SPEC §2).
+pub fn clip_payload(
+    env: &Envelope,
+    local_path: Option<&str>,
+    cached: Option<Vec<u8>>,
+) -> Result<(String, clipboard::Payload)> {
+    match env.typ {
+        MsgType::Text => {
+            let text = env.text.clone().unwrap_or_default();
+            Ok((blake3_hex(text.as_bytes()), clipboard::Payload::Text(text)))
+        }
+        MsgType::Image => {
+            let blob = env
+                .blob
+                .clone()
+                .ok_or_else(|| anyhow!("image envelope missing blob"))?;
+            let bytes = cached
+                .or_else(|| local_path.and_then(|p| std::fs::read(p).ok()))
+                .ok_or_else(|| anyhow!("image bytes unavailable"))?;
+            Ok((blob.hash.clone(), clipboard::Payload::ImagePng(bytes)))
+        }
+        MsgType::File => {
+            let path = local_path
+                .ok_or_else(|| anyhow!("file has no local path yet"))?
+                .to_string();
+            Ok((blake3_hex(path.as_bytes()), clipboard::Payload::Text(path)))
+        }
+    }
+}
+
 fn kind_matches(kind: RecvKind, env: &Envelope) -> bool {
     match kind {
         RecvKind::Any => true,
         RecvKind::Text => env.typ == MsgType::Text,
         RecvKind::Image => env.typ == MsgType::Image,
     }
+}
+
+fn base_name(s: &str) -> String {
+    Path::new(s)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| s.to_string())
 }
 
 fn describe(env: &Envelope) -> String {
@@ -795,6 +1188,11 @@ fn describe(env: &Envelope) -> String {
         MsgType::Image => {
             let (w, h) = env.blob.as_ref().map(|b| (b.w, b.h)).unwrap_or((0, 0));
             format!("image from {} ({w}x{h})", env.device_name)
+        }
+        MsgType::File => {
+            let size = env.blob.as_ref().map(|b| b.size).unwrap_or(0);
+            let name = env.filename.clone().unwrap_or_else(|| "file".into());
+            format!("file from {} ({name}, {size} bytes)", env.device_name)
         }
     }
 }
@@ -829,4 +1227,173 @@ async fn probe_alive(socket: &std::path::Path) -> bool {
         tokio::time::timeout(std::time::Duration::from_millis(300), IpcStream::connect(name)).await,
         Ok(Ok(_))
     )
+}
+
+// ---------------------------------------------------------------------------
+// Tests: the sink/session/clear logic is pure (no Endpoint), so it is exercised
+// directly here — the same code path the daemon runs on every received item.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_text(text: &str, device: &str) -> Envelope {
+        Envelope {
+            v: PROTO_V,
+            msg_id: Ulid::new().to_string(),
+            typ: MsgType::Text,
+            mime: "text/plain; charset=utf-8".into(),
+            sender: "peer0".into(),
+            device_name: device.into(),
+            ts: 1_720_000_000_000,
+            filename: None,
+            text: Some(text.into()),
+            blob: None,
+        }
+    }
+
+    fn env_blob(typ: MsgType, bytes: &[u8], filename: Option<&str>) -> Envelope {
+        Envelope {
+            v: PROTO_V,
+            msg_id: Ulid::new().to_string(),
+            typ,
+            mime: "application/octet-stream".into(),
+            sender: "peer0".into(),
+            device_name: "peerA".into(),
+            ts: 1_720_000_000_000,
+            filename: filename.map(|s| s.to_string()),
+            text: None,
+            blob: Some(Blob {
+                hash: blake3_hex(bytes),
+                size: bytes.len() as u64,
+                w: 0,
+                h: 0,
+            }),
+        }
+    }
+
+    /// Text appends to text_file with the SPEC §3 header; image/file land in save_dir under
+    /// their filename, de-duplicated on collision.
+    #[test]
+    fn sinks_append_text_and_save_image_and_file_with_dedup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let txt = tmp.path().join("log.txt");
+        std::fs::write(&txt, "PRE-EXISTING\n").unwrap();
+        let (sd, tf) = (save.to_string_lossy().to_string(), txt.to_string_lossy().to_string());
+
+        let sess = Mutex::new(Session::default());
+        sess.lock().unwrap().set_text_file(&tf);
+
+        route_sinks(&sess, &sd, &tf, &env_text("hello sinks", "peerA"), None);
+        let got = std::fs::read_to_string(&txt).unwrap();
+        assert!(got.starts_with("PRE-EXISTING\n"), "pre-session content lost: {got:?}");
+        assert!(got.contains("\n---\n"), "missing --- header: {got:?}");
+        assert!(got.contains("peerA 20"), "missing device + ISO ts: {got:?}");
+        assert!(got.contains("hello sinks"));
+
+        let png = b"\x89PNG\r\n\x1a\nfake";
+        route_sinks(&sess, &sd, &tf, &env_blob(MsgType::Image, png, Some("shot.png")), Some(png));
+        assert_eq!(std::fs::read(save.join("shot.png")).unwrap(), png);
+        // same name again -> dedup
+        route_sinks(&sess, &sd, &tf, &env_blob(MsgType::Image, png, Some("shot.png")), Some(png));
+        assert!(save.join("shot (2).png").exists(), "image dedup name missing");
+
+        let data = [0x00u8, 0x01, b'b', b'i', b'n', 0xff];
+        route_sinks(&sess, &sd, &tf, &env_blob(MsgType::File, &data, Some("report.bin")), Some(&data));
+        assert_eq!(std::fs::read(save.join("report.bin")).unwrap(), data);
+        route_sinks(&sess, &sd, &tf, &env_blob(MsgType::File, &data, Some("report.bin")), Some(&data));
+        assert!(save.join("report (2).bin").exists(), "file dedup name missing");
+
+        // No filename -> <hash>(.png)
+        let anon = env_blob(MsgType::File, &data, None);
+        let hash = anon.blob.as_ref().unwrap().hash.clone();
+        route_sinks(&sess, &sd, &tf, &anon, Some(&data));
+        assert!(save.join(&hash).exists(), "hash-named file missing");
+    }
+
+    /// `clear --all` truncates text_file back to the session-start offset and deletes only the
+    /// files this session wrote; pre-session content survives.
+    #[test]
+    fn clear_all_reverts_session_sinks_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let save = tmp.path().join("save");
+        let txt = tmp.path().join("log.txt");
+        let pre = "PRE-EXISTING LINE\n";
+        std::fs::write(&txt, pre).unwrap();
+        std::fs::create_dir_all(&save).unwrap();
+        std::fs::write(save.join("keep.dat"), "keep me").unwrap();
+        let (sd, tf) = (save.to_string_lossy().to_string(), txt.to_string_lossy().to_string());
+
+        let sess = Mutex::new(Session::default());
+        sess.lock().unwrap().set_text_file(&tf); // session-start offset = len(pre)
+
+        route_sinks(&sess, &sd, &tf, &env_text("session text", "peerA"), None);
+        let bytes = b"session-bytes";
+        route_sinks(&sess, &sd, &tf, &env_blob(MsgType::File, bytes, Some("a.bin")), Some(bytes));
+        route_sinks(&sess, &sd, &tf, &env_blob(MsgType::Image, bytes, Some("b.png")), Some(bytes));
+        assert_ne!(std::fs::read_to_string(&txt).unwrap(), pre);
+        assert!(save.join("a.bin").exists() && save.join("b.png").exists());
+
+        clear_sinks(&sess);
+
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), pre, "text_file not truncated to offset");
+        assert!(!save.join("a.bin").exists(), "session file not removed");
+        assert!(!save.join("b.png").exists(), "session image not removed");
+        assert!(save.join("keep.dat").exists(), "pre-session file wrongly deleted");
+        assert_eq!(std::fs::read_to_string(save.join("keep.dat")).unwrap(), "keep me");
+    }
+
+    /// Setting text_file mid-session anchors the offset to that file's current size.
+    #[test]
+    fn config_set_text_file_anchors_offset_mid_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let txt = tmp.path().join("log.txt");
+        let pre = "OLD CONTENT\n";
+        std::fs::write(&txt, pre).unwrap();
+        let tf = txt.to_string_lossy().to_string();
+
+        let sess = Mutex::new(Session::default()); // starts with no text_file
+        sess.lock().unwrap().set_text_file(&tf); // `config set text_file <path>`
+        route_sinks(&sess, "", &tf, &env_text("appended this session", "peerZ"), None);
+        assert_ne!(std::fs::read_to_string(&txt).unwrap(), pre);
+
+        clear_sinks(&sess);
+        assert_eq!(std::fs::read_to_string(&txt).unwrap(), pre);
+    }
+
+    /// A `file` has no image clipboard form: pasting it copies its **path as text** (SPEC §2).
+    #[test]
+    fn file_paste_copies_path_as_text() {
+        let bytes = b"\x00\x01binary";
+        let env = env_blob(MsgType::File, bytes, Some("r.bin"));
+        let path = "/tmp/clip-blobs/deadbeef.bin";
+        let (hash, payload) = clip_payload(&env, Some(path), None).unwrap();
+        match payload {
+            clipboard::Payload::Text(t) => assert_eq!(t, path),
+            _ => panic!("file must copy its path as clipboard text, not an image"),
+        }
+        assert_eq!(hash, blake3_hex(path.as_bytes()));
+
+        // Image still copies PNG bytes; text still copies its text.
+        let img = env_blob(MsgType::Image, bytes, Some("s.png"));
+        match clip_payload(&img, None, Some(bytes.to_vec())).unwrap().1 {
+            clipboard::Payload::ImagePng(b) => assert_eq!(b, bytes),
+            _ => panic!("image must copy PNG bytes"),
+        }
+        match clip_payload(&env_text("hi", "d"), None, None).unwrap().1 {
+            clipboard::Payload::Text(t) => assert_eq!(t, "hi"),
+            _ => panic!("text must copy text"),
+        }
+    }
+
+    /// `clear_on_exit` resolution for a non-interactive session end (SPEC §8).
+    #[test]
+    fn exit_scope_resolution() {
+        assert_eq!(resolve_exit_scope("ask"), "transient");
+        assert_eq!(resolve_exit_scope(""), "transient");
+        assert_eq!(resolve_exit_scope("all"), "all");
+        assert_eq!(resolve_exit_scope("never"), "never");
+    }
 }
