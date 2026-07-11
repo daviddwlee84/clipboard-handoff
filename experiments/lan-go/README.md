@@ -26,11 +26,19 @@ iroh's weight worth it, or is a hand-rolled LAN mesh good enough?*
 
 ```
 lan [--config-dir P --socket P --room NAME --json -q -v] <cmd>
-  daemon [--foreground]      send [--text|--image|--auto]   recv [--follow] [--latest-image --emit-path] [--out P]
-  paste                      status [--json]                peers [--json]
-  config set/get KEY [VALUE] pair            # pair is a no-op: discovery is automatic (mDNS)
+  daemon [--foreground] | daemon stop      send [PATH] [--text|--image|--file|--auto] [--name NAME]
+  recv [--follow] [--latest-image --emit-path] [--out P]   paste
+  clear [--all] [--yes]      # clear this session (transient; --all also reverts sinks) — SPEC §8
+  status [--json]            peers [--json]
+  config set/get KEY [VALUE] # keys: auto_copy, save_dir, text_file, clear_on_exit, device_name, room, …
+  pair                       # no-op: discovery is automatic (mDNS)
   tui                        # messenger-style chat TUI (SPEC §4); keybindings in experiments/README.md
 ```
+
+Arbitrary files, the additive `save_dir`/`text_file` sinks, and session
+clearing (`clear`, `daemon stop`, the TUI quit prompt) are shared plumbing in
+`shared-go` — see [experiments/README.md](../README.md) for the details and
+examples; behavior is identical across `lan` and `libp2p-mesh`.
 
 ## Bake-off harness hook
 

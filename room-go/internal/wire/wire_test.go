@@ -7,6 +7,8 @@ import (
 	"image/jpeg"
 	"image/png"
 	"testing"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 func TestEnvelopeCBORRoundTrip_Text(t *testing.T) {
@@ -65,6 +67,119 @@ func TestEnvelopeCBORRoundTrip_Image(t *testing.T) {
 	// Integrity: hash of decoded bytes must equal the announced hash.
 	if HashHex(out.BlobData) != out.Blob.Hash {
 		t.Fatalf("integrity check would fail after round-trip")
+	}
+}
+
+// A file envelope carries arbitrary bytes with a filename and survives the CBOR
+// round-trip; the BLAKE3 integrity check passes on the decoded bytes.
+func TestEnvelopeCBORRoundTrip_File(t *testing.T) {
+	data := []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 'h', 'i'} // arbitrary binary
+	in := &Envelope{
+		V:          Version,
+		MsgID:      "01ARZ3NDEKTSV4RRFFQ69G5FC1",
+		Type:       TypeFile,
+		Mime:       MimeOctet,
+		Sender:     "SHA256:ghi",
+		DeviceName: "laptop",
+		TS:         1720000000002,
+		Filename:   "report.bin",
+		Blob:       &Blob{Hash: HashHex(data), Size: uint64(len(data))},
+		BlobData:   data,
+	}
+	b, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out, err := Unmarshal(b)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.Type != TypeFile || out.Filename != "report.bin" {
+		t.Fatalf("file envelope mismatch: type=%q filename=%q", out.Type, out.Filename)
+	}
+	if out.Blob == nil || out.Blob.Hash != in.Blob.Hash || out.Blob.Size != in.Blob.Size {
+		t.Fatalf("blob mismatch: %+v", out.Blob)
+	}
+	if !bytes.Equal(out.BlobData, in.BlobData) {
+		t.Fatalf("file bytes not preserved across CBOR round-trip")
+	}
+	if HashHex(out.BlobData) != out.Blob.Hash {
+		t.Fatalf("integrity check would fail after round-trip")
+	}
+}
+
+// Unknown fields are ignored on decode, so a peer running an older schema (one
+// that never saw `filename`/type=file) still decodes cleanly — wire back-compat.
+func TestUnmarshal_IgnoresUnknownFields(t *testing.T) {
+	// Encode a superset map with an extra unknown key alongside the known ones.
+	extra := map[string]any{
+		"v":           Version,
+		"msg_id":      "01ARZ3NDEKTSV4RRFFQ69G5FC2",
+		"type":        TypeText,
+		"mime":        MimeText,
+		"sender":      "SHA256:jkl",
+		"device_name": "laptop",
+		"ts":          uint64(1720000000003),
+		"text":        "back-compat",
+		"future_key":  "should be ignored",
+	}
+	b, err := cbor.Marshal(extra)
+	if err != nil {
+		t.Fatalf("Marshal map: %v", err)
+	}
+	out, err := Unmarshal(b)
+	if err != nil {
+		t.Fatalf("Unmarshal with unknown field errored: %v", err)
+	}
+	if out.Text != "back-compat" || out.Type != TypeText {
+		t.Fatalf("known fields lost: %+v", out)
+	}
+}
+
+func TestClassify(t *testing.T) {
+	pngBytes := makePNG(t, 2, 2)
+	jpegBytes := makeJPEG(t, 2, 2)
+	binary := []byte{0xff, 0xfe, 0x00, 0x01}
+	text := []byte("hello world")
+
+	cases := []struct {
+		name      string
+		in        []byte
+		forceFile bool
+		want      string
+	}{
+		{"png-auto", pngBytes, false, TypeImage},
+		{"jpeg-auto", jpegBytes, false, TypeImage},
+		{"text-auto", text, false, TypeText},
+		{"binary-auto", binary, false, TypeFile},
+		{"text-forcefile", text, true, TypeFile},
+		{"binary-forcefile", binary, true, TypeFile},
+		{"png-forcefile-still-image", pngBytes, true, TypeImage}, // magic wins (PROTOCOL §2)
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := Classify(c.in, c.forceFile); got != c.want {
+				t.Fatalf("Classify(%s) = %q, want %q", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+func TestMimeForFilename(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+	}{
+		{"a.png", "image/png"},         // builtin, deterministic
+		{"doc.pdf", "application/pdf"}, // builtin, deterministic
+		{"data.zzz", MimeOctet},        // unknown extension
+		{"noext", MimeOctet},           // no extension
+		{"", MimeOctet},                // empty
+	}
+	for _, c := range cases {
+		if got := MimeForFilename(c.name); got != c.want {
+			t.Errorf("MimeForFilename(%q) = %q, want %q", c.name, got, c.want)
+		}
 	}
 }
 

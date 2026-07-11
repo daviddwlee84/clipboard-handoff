@@ -15,6 +15,8 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"mime"
+	"path/filepath"
 	"unicode/utf8"
 
 	"github.com/fxamacker/cbor/v2"
@@ -29,43 +31,59 @@ const Version uint16 = 1
 // (~210 KiB). 32 MiB leaves headroom without inviting abuse.
 const MaxFrame = 32 << 20
 
-// Blob is the content-addressed reference for an image (PROTOCOL §1). In
-// Phase 0 the PNG bytes ride inline in Envelope.BlobData; announce+pull is the
-// Phase 1 target.
+// Blob is the content-addressed reference for an image or file (PROTOCOL §1).
+// In Phase 0 the bytes ride inline in Envelope.BlobData; announce+pull is the
+// Phase 1 target. W/H are set for images only.
 type Blob struct {
-	Hash string `cbor:"hash"` // BLAKE3 hex of the PNG bytes — also the integrity check
-	Size uint64 `cbor:"size"` // PNG byte length
+	Hash string `cbor:"hash"` // BLAKE3 hex of the bytes — also the integrity check
+	Size uint64 `cbor:"size"` // byte length
 	W    uint32 `cbor:"w"`
 	H    uint32 `cbor:"h"`
 }
 
-// Envelope is the on-the-wire message (PROTOCOL §1). Encoded as CBOR.
+// Envelope is the on-the-wire message (PROTOCOL §1). Encoded as CBOR. Unknown
+// fields are ignored on decode, so the shape stays back-compatible.
 type Envelope struct {
 	V          uint16 `cbor:"v"`
 	MsgID      string `cbor:"msg_id"` // ULID — the dedupe key
-	Type       string `cbor:"type"`   // "text" | "image"
+	Type       string `cbor:"type"`   // "text" | "image" | "file"
 	Mime       string `cbor:"mime"`
 	Sender     string `cbor:"sender"` // stable peer identity: TLS cert fp / libp2p PeerId
 	DeviceName string `cbor:"device_name"`
 	TS         uint64 `cbor:"ts"` // unix milliseconds at the sender
 
-	Text string `cbor:"text,omitempty"` // type=text: inline UTF-8 payload
-	Blob *Blob  `cbor:"blob,omitempty"` // type=image: content-addressed reference
+	Filename string `cbor:"filename,omitempty"` // image/file: original name, advisory (folder/save sinks)
 
-	// BlobData carries the PNG bytes inline. This is the documented Phase 0
-	// inline extension (PROTOCOL §1 "blob_data"). PNG is the canonical wire
-	// format regardless and blob.hash is still verified on receipt.
+	Text string `cbor:"text,omitempty"` // type=text: inline UTF-8 payload
+	Blob *Blob  `cbor:"blob,omitempty"` // type=image|file: content-addressed reference
+
+	// BlobData carries the image/file bytes inline. This is the documented
+	// Phase 0 inline extension (PROTOCOL §1 "blob_data"). PNG is the canonical
+	// wire format for images regardless and blob.hash is still verified on receipt.
 	BlobData []byte `cbor:"blob_data,omitempty"`
 }
 
 const (
 	TypeText  = "text"
 	TypeImage = "image"
+	TypeFile  = "file"
 
-	MimeText = "text/plain; charset=utf-8"
-	MimePNG  = "image/png"
-	MimeJPEG = "image/jpeg"
+	MimeText  = "text/plain; charset=utf-8"
+	MimePNG   = "image/png"
+	MimeJPEG  = "image/jpeg"
+	MimeOctet = "application/octet-stream"
 )
+
+// MimeForFile returns a best-effort MIME type for a file, from its extension
+// (PROTOCOL §1: "best-effort for files"), falling back to application/octet-stream.
+func MimeForFile(filename string) string {
+	if ext := filepath.Ext(filename); ext != "" {
+		if m := mime.TypeByExtension(ext); m != "" {
+			return m
+		}
+	}
+	return MimeOctet
+}
 
 // Marshal encodes an Envelope to CBOR.
 func Marshal(e *Envelope) ([]byte, error) { return cbor.Marshal(e) }

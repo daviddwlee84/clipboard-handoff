@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +66,61 @@ func TestEnvelopeCBORRoundTrip_Image(t *testing.T) {
 	// Integrity: hash of decoded bytes must equal the announced hash.
 	if HashHex(out.BlobData) != out.Blob.Hash {
 		t.Fatalf("integrity check would fail after round-trip")
+	}
+}
+
+func TestEnvelopeCBORRoundTrip_File(t *testing.T) {
+	payload := []byte{0x00, 0x01, 0x02, 0xff, 0xfe, 'z', 'i', 'p'}
+	in := &Envelope{
+		V:        Version,
+		MsgID:    "01ARZ3NDEKTSV4RRFFQ69G5FC1",
+		Type:     TypeFile,
+		Mime:     MimeForFile("archive.zip"),
+		Sender:   "fp:file",
+		TS:       1720000000002,
+		Filename: "archive.zip",
+		Blob:     &Blob{Hash: HashHex(payload), Size: uint64(len(payload))},
+		BlobData: payload,
+	}
+	b, err := Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out, err := Unmarshal(b)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.Type != TypeFile || out.Filename != "archive.zip" {
+		t.Fatalf("file envelope round-trip mismatch: type=%q filename=%q", out.Type, out.Filename)
+	}
+	if out.Blob == nil || out.Blob.Hash != in.Blob.Hash || out.Blob.Size != in.Blob.Size {
+		t.Fatalf("file blob mismatch: %+v", out.Blob)
+	}
+	if out.Blob.W != 0 || out.Blob.H != 0 {
+		t.Fatalf("file blob should carry no image dims, got w=%d h=%d", out.Blob.W, out.Blob.H)
+	}
+	if !bytes.Equal(out.BlobData, in.BlobData) {
+		t.Fatalf("file bytes not preserved across CBOR round-trip")
+	}
+	if HashHex(out.BlobData) != out.Blob.Hash {
+		t.Fatalf("file integrity check would fail after round-trip")
+	}
+}
+
+func TestMimeForFile(t *testing.T) {
+	cases := []struct{ name, want string }{
+		{"notes.txt", "text/plain"},
+		{"data.json", "application/json"},
+		{"noext", MimeOctet},
+		{"weird.xyzzy", MimeOctet},
+		{"", MimeOctet},
+	}
+	for _, c := range cases {
+		got := MimeForFile(c.name)
+		// Extension MIME types may carry a "; charset=..." suffix; match the prefix.
+		if got != c.want && !strings.HasPrefix(got, c.want) {
+			t.Errorf("MimeForFile(%q) = %q, want %q (or prefix)", c.name, got, c.want)
+		}
 	}
 }
 

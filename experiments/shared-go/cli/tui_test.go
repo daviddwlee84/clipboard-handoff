@@ -16,6 +16,7 @@ type fakeClient struct {
 	sends  []fakeCall
 	copies []fakeCall
 	pastes int
+	clears []bool // records Clear(all) calls
 }
 
 type fakeCall struct {
@@ -31,7 +32,8 @@ func (f *fakeClient) Copy(force string, data []byte) error {
 	f.copies = append(f.copies, fakeCall{force, data})
 	return nil
 }
-func (f *fakeClient) Paste() error { f.pastes++; return nil }
+func (f *fakeClient) Paste() error         { f.pastes++; return nil }
+func (f *fakeClient) Clear(all bool) error { f.clears = append(f.clears, all); return nil }
 func (f *fakeClient) Status() (*ipc.Status, error) {
 	return &ipc.Status{Room: "default", Clipboard: "available"}, nil
 }
@@ -166,5 +168,55 @@ func TestCopySelectedText(t *testing.T) {
 	}
 	if len(fc.copies) != 1 || fc.copies[0].force != "text" || string(fc.copies[0].data) != "copy me" {
 		t.Fatalf("Copy not recorded correctly: %+v", fc.copies)
+	}
+}
+
+// TestQuitPromptsClearAfterReceive: pressing q after receiving an item raises the
+// clear prompt (does not quit); choosing [a] runs Clear(all=true) then quits.
+func TestQuitPromptsClearAfterReceive(t *testing.T) {
+	fc := &fakeClient{}
+	m := newTestModel(fc)
+
+	// Receive an item so the session has data.
+	env := wire.Envelope{Type: wire.TypeText, Text: "hi", DeviceName: "peerA", TS: uint64(time.Now().UnixMilli())}
+	next, _ := m.Update(itemMsg{item: &ipc.Item{Envelope: env}})
+	m = next.(tuiModel)
+	if !m.gotItem {
+		t.Fatalf("gotItem should be set after receiving an item")
+	}
+
+	// q in browse mode should NOT quit yet; it opens the clear prompt.
+	m.composerFocused = false
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m = next.(tuiModel)
+	if !m.confirmingQuit {
+		t.Fatalf("q after receive should raise the clear prompt, not quit")
+	}
+	if cmd != nil {
+		t.Fatalf("raising the prompt should not return a command (no quit yet)")
+	}
+
+	// Choosing [a] should run Clear(all=true) and then quit.
+	_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	if cmd == nil {
+		t.Fatalf("choosing [a] should return the quit command")
+	}
+	if len(fc.clears) != 1 || fc.clears[0] != true {
+		t.Fatalf("expected one Clear(all=true), got %+v", fc.clears)
+	}
+}
+
+// TestQuitImmediateWhenNothingReceived: with no received items, q quits directly
+// without the clear prompt.
+func TestQuitImmediateWhenNothingReceived(t *testing.T) {
+	m := newTestModel(&fakeClient{})
+	m.composerFocused = false
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	m = next.(tuiModel)
+	if m.confirmingQuit {
+		t.Fatalf("q with nothing received should not raise the clear prompt")
+	}
+	if cmd == nil {
+		t.Fatalf("q with nothing received should quit (non-nil command)")
 	}
 }

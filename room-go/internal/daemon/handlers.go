@@ -47,6 +47,10 @@ func (d *Daemon) handleConn(c net.Conn) {
 		d.handleConfigGet(c, req)
 	case ipc.OpJoin:
 		d.handleJoin(c, req)
+	case ipc.OpClear:
+		d.handleClear(c, req)
+	case ipc.OpDaemonStop:
+		d.handleDaemonStop(c, req)
 	default:
 		_ = ipc.WriteResp(c, errResp(2, "unknown op: "+req.Op))
 	}
@@ -64,33 +68,30 @@ func (d *Daemon) handleSend(c net.Conn, req *ipc.Request) {
 		Sender:     d.fp,
 		DeviceName: d.deviceName,
 		TS:         uint64(time.Now().UnixMilli()),
+		Filename:   req.Filename,
 	}
 
-	// Decide text vs image: honor --text/--image force, else sniff.
-	asImage := false
+	// Decide the wire type: honor a force flag (--text/--image/--file), else
+	// sniff under the --auto rules (PROTOCOL §2).
+	var typ string
 	switch req.Force {
 	case "text":
+		typ = wire.TypeText
+	case "image":
+		typ = wire.TypeImage
+	case "file":
+		typ = wire.TypeFile
+	default:
+		typ = wire.Classify(req.Bytes, false)
+	}
+
+	switch typ {
+	case wire.TypeText:
 		env.Type = wire.TypeText
 		env.Mime = wire.MimeText
 		env.Text = string(req.Bytes)
-	case "image":
-		asImage = true
-	default:
-		kind, serr := wire.Sniff(req.Bytes)
-		if serr != nil {
-			_ = ipc.WriteResp(c, errResp(2, serr.Error()))
-			return
-		}
-		if kind == wire.KindText {
-			env.Type = wire.TypeText
-			env.Mime = wire.MimeText
-			env.Text = string(req.Bytes)
-		} else {
-			asImage = true
-		}
-	}
-
-	if asImage {
+		env.Filename = "" // text carries no filename
+	case wire.TypeImage:
 		kind, serr := wire.Sniff(req.Bytes)
 		if serr != nil || (kind != wire.KindPNG && kind != wire.KindJPEG) {
 			_ = ipc.WriteResp(c, errResp(2, "not a supported image (PNG/JPEG)"))
@@ -110,6 +111,11 @@ func (d *Daemon) handleSend(c net.Conn, req *ipc.Request) {
 		env.Mime = wire.MimePNG
 		env.Blob = &wire.Blob{Hash: wire.HashHex(png), Size: uint64(len(png)), W: w, H: h}
 		env.BlobData = png // Phase 0: inline
+	case wire.TypeFile:
+		env.Type = wire.TypeFile
+		env.Mime = wire.MimeForFilename(req.Filename)
+		env.Blob = &wire.Blob{Hash: wire.HashHex(req.Bytes), Size: uint64(len(req.Bytes))}
+		env.BlobData = req.Bytes // Phase 0: inline
 	}
 
 	frame, err := wire.Marshal(env)
@@ -123,7 +129,7 @@ func (d *Daemon) handleSend(c net.Conn, req *ipc.Request) {
 		_ = ipc.WriteResp(c, &ipc.Response{IPCVersion: ipc.IPCVersion, Kind: ipc.RespOK, Code: 4, Message: err.Error()})
 		return
 	}
-	log.Info("sent", "type", env.Type, "msg_id", env.MsgID)
+	log.Info("sent", "type", env.Type, "msg_id", env.MsgID, "filename", env.Filename)
 	_ = ipc.WriteResp(c, okResp())
 }
 
@@ -242,8 +248,12 @@ func (d *Daemon) handleConfigSet(c net.Conn, req *ipc.Request) {
 		_ = ipc.WriteResp(c, errResp(2, err.Error()))
 		return
 	}
-	if req.Key == "device_name" {
+	switch req.Key {
+	case "device_name":
 		d.deviceName = req.Value
+	case "text_file":
+		// Anchor the session truncation offset to the new sink (SPEC §8).
+		d.sess.setTextFile(req.Value)
 	}
 	_ = ipc.WriteResp(c, okResp())
 }
@@ -275,18 +285,47 @@ func (d *Daemon) handleJoin(c net.Conn, req *ipc.Request) {
 	_ = ipc.WriteResp(c, okResp())
 }
 
-// writeClipboard writes an item to the OS clipboard and records its content
-// hash for echo suppression (SPEC §3 rule 2).
-func (d *Daemon) writeClipboard(item *ipc.Item) error {
-	env := &item.Envelope
-	var hash string
-	var err error
-	if env.Type == wire.TypeText {
-		hash = wire.HashHex([]byte(env.Text))
-		err = clip.WriteText(env.Text)
+// handleClear runs `room clear` (SPEC §8). It always clears the transient
+// store; req.All additionally reverts this session's sink writes. The client
+// has already handled the confirmation prompt.
+func (d *Daemon) handleClear(c net.Conn, req *ipc.Request) {
+	if req.All {
+		d.applyClearScope("all")
 	} else {
-		hash = env.Blob.Hash
-		err = clip.WritePNG(env.BlobData)
+		d.applyClearScope("transient")
+	}
+	_ = ipc.WriteResp(c, okResp())
+}
+
+// handleDaemonStop runs `room daemon stop` (SPEC §8): apply the resolved clear
+// scope (the client resolved clear_on_exit, prompting on a TTY for `ask`), ack,
+// then shut the daemon down.
+func (d *Daemon) handleDaemonStop(c net.Conn, req *ipc.Request) {
+	scope := req.Scope
+	if scope == "" {
+		// Fall back to the configured policy, non-interactively.
+		scope = d.cfg.Get().ClearOnExit
+		if scope == "ask" {
+			scope = "transient"
+		}
+	}
+	d.applyClearScope(scope)
+	_ = ipc.WriteResp(c, okResp())
+	// The Ok is buffered in the socket and stays readable after we exit, so it
+	// is safe to trigger shutdown now.
+	d.triggerStop()
+}
+
+// writeClipboard writes an item to the OS clipboard and records its content
+// hash for echo suppression (SPEC §3 rule 2). Text/file place text (a file
+// copies its local path, SPEC §2); an image places PNG bytes.
+func (d *Daemon) writeClipboard(item *ipc.Item) error {
+	isImage, text, png, hash := clipContent(item)
+	var err error
+	if isImage {
+		err = clip.WritePNG(png)
+	} else {
+		err = clip.WriteText(text)
 	}
 	if err != nil {
 		return err

@@ -41,7 +41,15 @@ type Daemon struct {
 	subs     map[chan *ipc.Item]struct{}
 	lastCopy string // BLAKE3 of the last value we wrote to our own clipboard (SPEC §3 rule 2)
 
-	done chan struct{}
+	// Session state (SPEC §8): tracked so `clear` / exit is precise and never
+	// destructive beyond this session.
+	sessionSaveFiles []string         // files this session wrote into save_dir
+	textBaseline     map[string]int64 // text_file path -> size at session start (truncate target)
+	gotReceive       bool             // received anything this session
+	stopPolicy       string           // resolved clear_on_exit to apply on shutdown ("" = read config)
+
+	cancel context.CancelFunc // triggers shutdown (daemon stop)
+	done   chan struct{}
 }
 
 // New builds a daemon over the given transport. room overrides the configured
@@ -64,16 +72,27 @@ func New(cfg *config.Store, socketPath, room, transportTag string, tr transport.
 		deviceName:   settings.DeviceName,
 		dedupe:       NewDedupe(4096),
 		subs:         make(map[chan *ipc.Item]struct{}),
+		textBaseline: make(map[string]int64),
 		done:         make(chan struct{}),
 	}
 }
 
 // Run starts the transport and the IPC listener, then blocks until ctx is
-// cancelled.
-func (d *Daemon) Run(ctx context.Context) error {
+// cancelled (signal) or `daemon stop` triggers shutdown. On exit it applies the
+// clear_on_exit policy (SPEC §8).
+func (d *Daemon) Run(ctx context.Context) (err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	d.cancel = cancel
+	defer cancel()
+
 	if err := os.MkdirAll(d.cfg.BlobDir(), 0o700); err != nil {
 		return err
 	}
+	// Record the text_file's session-start offset now so `clear --all` only
+	// reverts text appended during this session (SPEC §8).
+	d.recordTextBaseline(d.cfg.Get().TextFile)
+	// On any shutdown, apply the exit policy (transient/all/never) once.
+	defer d.applyExitPolicy()
 
 	d.tr.OnReceive(d.ingest)
 	if err := d.tr.Start(ctx); err != nil {
@@ -127,13 +146,21 @@ func (d *Daemon) ingest(env *wire.Envelope) {
 
 	item := &ipc.Item{Envelope: *env}
 
-	if env.Type == wire.TypeImage {
+	if env.Type == wire.TypeImage || env.Type == wire.TypeFile {
 		// Integrity check (PROTOCOL §1): blob.hash MUST be verified on receipt.
 		if env.Blob == nil || wire.HashHex(env.BlobData) != env.Blob.Hash {
-			log.Printf("image integrity check failed; dropping msg_id=%s", env.MsgID)
+			log.Printf("blob integrity check failed; dropping msg_id=%s", env.MsgID)
 			return
 		}
-		path := filepath.Join(d.cfg.BlobDir(), env.Blob.Hash+".png")
+		// Materialize the bytes to the blob cache (also the recv --emit-path temp
+		// file). Name by hash; keep a usable extension so it opens externally.
+		name := env.Blob.Hash
+		if env.Type == wire.TypeImage {
+			name += ".png"
+		} else if ext := filepath.Ext(env.Filename); ext != "" {
+			name += ext
+		}
+		path := filepath.Join(d.cfg.BlobDir(), name)
 		if err := os.WriteFile(path, env.BlobData, 0o600); err != nil {
 			log.Printf("write blob: %v", err)
 			return
@@ -146,6 +173,7 @@ func (d *Daemon) ingest(env *wire.Envelope) {
 	if len(d.buffer) > bufferCap {
 		d.buffer = d.buffer[len(d.buffer)-bufferCap:]
 	}
+	d.gotReceive = true
 	subs := make([]chan *ipc.Item, 0, len(d.subs))
 	for ch := range d.subs {
 		subs = append(subs, ch)
@@ -160,7 +188,10 @@ func (d *Daemon) ingest(env *wire.Envelope) {
 		}
 	}
 
+	// Additive sinks (SPEC §3): clipboard (per auto_copy) plus, if configured,
+	// the folder/append-file sinks. Independent of one another.
 	d.applyAutoCopy(item)
+	d.routeSinks(item)
 }
 
 // applyAutoCopy enforces SPEC §3. Phase 0 trusts all senders (TOFU allowlist is
@@ -176,12 +207,18 @@ func (d *Daemon) applyAutoCopy(item *ipc.Item) {
 	case "on":
 		var err error
 		var hash string
-		if env.Type == wire.TypeText {
+		switch env.Type {
+		case wire.TypeText:
 			hash = wire.HashHex([]byte(env.Text))
 			err = clip.WriteText(env.Text)
-		} else {
+		case wire.TypeImage:
 			hash = env.Blob.Hash
 			err = clip.WritePNG(env.BlobData)
+		case wire.TypeFile:
+			// A file has no clipboard image form (SPEC §3); it lands in the folder
+			// sink instead. Nothing to auto-copy.
+			log.Printf("received file (auto_copy on; no clipboard form) from=%s name=%q", label, env.Filename)
+			return
 		}
 		if err != nil {
 			log.Printf("auto_copy on: clipboard write failed: %v", err)
@@ -202,8 +239,11 @@ func (d *Daemon) applyAutoCopy(item *ipc.Item) {
 // is a Phase 1 nicety). It does NOT write the clipboard.
 func (d *Daemon) notify(env *wire.Envelope, label string) {
 	preview := env.Text
-	if env.Type == wire.TypeImage && env.Blob != nil {
+	switch {
+	case env.Type == wire.TypeImage && env.Blob != nil:
 		preview = "image " + itoa(int(env.Blob.W)) + "x" + itoa(int(env.Blob.H))
+	case env.Type == wire.TypeFile && env.Blob != nil:
+		preview = "file " + env.Filename + " (" + itoa(int(env.Blob.Size)) + "B)"
 	}
 	log.Printf("received (notify) from=%s type=%s preview=%q", label, env.Type, truncate(preview, 40))
 }
@@ -249,6 +289,8 @@ func matchesKind(item *ipc.Item, kind string) bool {
 		return item.Envelope.Type == wire.TypeText
 	case wire.TypeImage:
 		return item.Envelope.Type == wire.TypeImage
+	case wire.TypeFile:
+		return item.Envelope.Type == wire.TypeFile
 	default:
 		return true
 	}

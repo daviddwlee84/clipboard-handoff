@@ -7,6 +7,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -66,6 +68,8 @@ func (g Globals) dispatch(sub string, args []string) int {
 		return g.cmdRecv(args)
 	case "paste":
 		return g.cmdPaste(args)
+	case "clear":
+		return g.cmdClear(args)
 	case "tui":
 		return g.cmdTUI(args)
 	case "status":
@@ -163,6 +167,10 @@ func (g Globals) effectiveRoom(cfg *config.Store) string {
 // ---- daemon ----------------------------------------------------------------
 
 func (g Globals) cmdDaemon(args []string) int {
+	if len(args) > 0 && args[0] == "stop" {
+		return g.cmdDaemonStop(args[1:])
+	}
+
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	_ = fs.Bool("foreground", false, "run in the foreground (default when launched directly)")
 	if err := fs.Parse(args); err != nil {
@@ -196,32 +204,131 @@ func (g Globals) cmdDaemon(args []string) int {
 	return 0
 }
 
+// cmdDaemonStop shuts down the resident daemon, applying clear_on_exit (SPEC §8).
+// It resolves the interactive "ask" policy client-side (prompt on a TTY → t/a/n,
+// else transient) and hands the daemon the concrete policy. It never auto-spawns
+// a daemon just to stop it.
+func (g Globals) cmdDaemonStop(args []string) int {
+	fs := flag.NewFlagSet("daemon stop", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	sock, err := g.socketPath()
+	if err != nil {
+		return g.fail(1, err)
+	}
+	conn, err := ipc.Dial(sock, false, nil) // do NOT spawn a daemon just to stop it
+	if err != nil {
+		if !g.Quiet {
+			fmt.Fprintf(os.Stderr, "%s: no daemon running\n", g.app.BinName)
+		}
+		return 3
+	}
+	defer conn.Close()
+
+	policy := g.resolveExitPolicy()
+	if err := ipc.WriteReq(conn, &ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpDaemonStop, Value: policy}); err != nil {
+		return g.fail(3, err)
+	}
+	resp, err := ipc.ReadResp(conn)
+	if err != nil {
+		return g.fail(3, err)
+	}
+	if resp.Kind == ipc.RespErr {
+		return g.fail(resp.Code, errors.New(resp.Message))
+	}
+	if !g.Quiet {
+		fmt.Printf("daemon stopping (clear_on_exit: %s)\n", policy)
+	}
+	return 0
+}
+
+// resolveExitPolicy reads clear_on_exit and resolves the interactive "ask" to a
+// concrete scope: a TTY prompt (t/a/n) when attached, else "transient".
+func (g Globals) resolveExitPolicy() string {
+	policy := "ask"
+	if cfg, err := g.openConfig(); err == nil {
+		if p := cfg.Get().ClearOnExit; p != "" {
+			policy = p
+		}
+	}
+	if policy != "ask" {
+		return policy
+	}
+	if !stdinIsTTY() {
+		return "transient"
+	}
+	switch promptChoice("clear this session on exit? [t]ransient / [a]ll incl sinks / [n]o: ") {
+	case "a":
+		return "all"
+	case "n":
+		return "never"
+	default:
+		return "transient"
+	}
+}
+
 // ---- send ------------------------------------------------------------------
 
 func (g Globals) cmdSend(args []string) int {
 	fs := flag.NewFlagSet("send", flag.ContinueOnError)
 	asText := fs.Bool("text", false, "force text")
 	asImage := fs.Bool("image", false, "force image (PNG/JPEG)")
+	asFile := fs.Bool("file", false, "force file (arbitrary bytes)")
 	_ = fs.Bool("auto", false, "sniff type (default)")
-	if err := fs.Parse(args); err != nil {
-		return 2
+	name := fs.String("name", "", "filename for image/file items (advisory)")
+	// Parse flags even when they follow the positional PATH (SPEC signature
+	// `send [PATH] [--file] [--name NAME]`); the stdlib flag package otherwise
+	// stops at the first non-flag, so parse in a loop collecting positionals.
+	rest := args
+	var positionals []string
+	for {
+		if err := fs.Parse(rest); err != nil {
+			return 2
+		}
+		rest = fs.Args()
+		if len(rest) == 0 {
+			break
+		}
+		positionals = append(positionals, rest[0])
+		rest = rest[1:]
 	}
 
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return g.fail(1, err)
+	// Read PATH if given, else stdin (SPEC §2). A PATH (or --name) sets filename.
+	var data []byte
+	var err error
+	filename := *name
+	if len(positionals) > 0 {
+		path := positionals[0]
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return g.fail(1, err)
+		}
+		if filename == "" {
+			filename = filepath.Base(path)
+		}
+	} else {
+		data, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			return g.fail(1, err)
+		}
 	}
 	if len(data) == 0 {
-		return g.fail(2, errors.New("send: empty stdin"))
-	}
-	force := ""
-	if *asText {
-		force = "text"
-	} else if *asImage {
-		force = "image"
+		return g.fail(2, errors.New("send: empty input"))
 	}
 
-	resp, code := g.roundtrip(&ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpSend, Bytes: data, Force: force})
+	force := ""
+	switch {
+	case *asText:
+		force = "text"
+	case *asImage:
+		force = "image"
+	case *asFile:
+		force = "file"
+	}
+
+	resp, code := g.roundtrip(&ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpSend, Bytes: data, Force: force, Name: filename})
 	if code != 0 {
 		return code
 	}
@@ -286,7 +393,7 @@ func (g Globals) cmdRecv(args []string) int {
 	return 0
 }
 
-// printItem renders one item to stdout: text inline; image as a file path
+// printItem renders one item to stdout: text inline; image/file as a file path
 // (copied to --out first if requested).
 func printItem(resp *ipc.Response, emitPath bool, out string) {
 	if resp.Kind != ipc.RespItem || resp.Item == nil {
@@ -305,9 +412,21 @@ func printItem(resp *ipc.Response, emitPath bool, out string) {
 	}
 	if emitPath || out != "" {
 		fmt.Println(path)
-	} else {
-		fmt.Printf("[image %dx%d %s]\n", env.Blob.W, env.Blob.H, path)
+		return
 	}
+	if env.Type == "file" {
+		name := env.Filename
+		if name == "" && env.Blob != nil {
+			name = short(env.Blob.Hash)
+		}
+		size := uint64(0)
+		if env.Blob != nil {
+			size = env.Blob.Size
+		}
+		fmt.Printf("[file %s %dB %s]\n", name, size, path)
+		return
+	}
+	fmt.Printf("[image %dx%d %s]\n", env.Blob.W, env.Blob.H, path)
 }
 
 // ---- paste -----------------------------------------------------------------
@@ -322,6 +441,51 @@ func (g Globals) cmdPaste(args []string) int {
 	}
 	if !g.Quiet {
 		fmt.Println("pasted latest item to clipboard")
+	}
+	return 0
+}
+
+// ---- clear -----------------------------------------------------------------
+
+// cmdClear reverts this session's received data (SPEC §8). Default: transient
+// only. --all also reverts session sink writes (truncate text_file, delete
+// save_dir files this session wrote) — prompts unless --yes / not a TTY.
+func (g Globals) cmdClear(args []string) int {
+	fs := flag.NewFlagSet("clear", flag.ContinueOnError)
+	all := fs.Bool("all", false, "also revert this session's sink writes (text_file + save_dir)")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt for --all")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	reqAll := false
+	if *all {
+		switch {
+		case *yes:
+			reqAll = true
+		case stdinIsTTY():
+			reqAll = promptYesNo("revert this session's sink writes (truncate text_file, delete save_dir files written this session)? [y/N] ")
+			if !reqAll && !g.Quiet {
+				fmt.Fprintf(os.Stderr, "%s: sinks kept; clearing transient only\n", g.app.BinName)
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "%s: --all needs --yes without a TTY; clearing transient only\n", g.app.BinName)
+		}
+	}
+
+	resp, code := g.roundtrip(&ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpClear, All: reqAll})
+	if code != 0 {
+		return code
+	}
+	if resp.Kind == ipc.RespErr {
+		return g.fail(resp.Code, errors.New(resp.Message))
+	}
+	if !g.Quiet {
+		if reqAll {
+			fmt.Println("cleared this session (transient + sink writes)")
+		} else {
+			fmt.Println("cleared this session (transient)")
+		}
 	}
 	return 0
 }
@@ -466,6 +630,42 @@ func (g Globals) fail(code int, err error) int {
 	return code
 }
 
+// stdinIsTTY reports whether stdin is an interactive terminal (so we may prompt).
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// promptLine writes a prompt to stderr and reads one trimmed, lowercased line.
+func promptLine(prompt string) string {
+	fmt.Fprint(os.Stderr, prompt)
+	r := bufio.NewReader(os.Stdin)
+	line, _ := r.ReadString('\n')
+	return strings.ToLower(strings.TrimSpace(line))
+}
+
+// promptYesNo returns true only for an affirmative (y/yes) answer.
+func promptYesNo(prompt string) bool {
+	switch promptLine(prompt) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+// promptChoice returns the first letter of the answer ("t"/"a"/"n"/…).
+func promptChoice(prompt string) string {
+	ans := promptLine(prompt)
+	if ans == "" {
+		return ""
+	}
+	return ans[:1]
+}
+
 func short(s string) string {
 	if len(s) <= 20 {
 		return s
@@ -488,14 +688,15 @@ Global flags:
   -v, --verbose       debug logging
 
 Commands:
-  daemon   [--foreground]                 run the resident daemon (auto-spawned)
-  send     [--text|--image|--auto]        reads stdin, sniffs, broadcasts
+  daemon   [--foreground] | daemon stop     run/stop the resident daemon (auto-spawned)
+  send     [PATH] [--text|--image|--file|--auto] [--name NAME]
   recv     [--follow] [--latest-image --emit-path] [--out PATH]
   paste                                   write latest received item to OS clipboard
+  clear    [--all] [--yes]                clear this session (transient; --all also reverts sinks)
   tui                                     launch the messenger-style chat TUI (SPEC §4)
   status   [--json]
   peers    [--json]
-  config   set KEY VALUE | get KEY
+  config   set KEY VALUE | get KEY        keys: auto_copy, save_dir, text_file, clear_on_exit, …
   pair                                    no-op: discovery is automatic (mDNS)
 `, a.BinName, a.Tagline, a.BinName)
 }

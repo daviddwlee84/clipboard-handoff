@@ -24,6 +24,9 @@ type daemonClient interface {
 	// clipboard: a received item by msgID, else fallbackText inline, else the
 	// latest buffered item.
 	Copy(msgID, fallbackText string) error
+	// Clear runs the session clear (SPEC §8) on the daemon: transient by
+	// default; all also reverts this session's sink writes.
+	Clear(all bool) error
 }
 
 // Options configure how the TUI reaches the local daemon.
@@ -85,6 +88,17 @@ func (c *ipcClient) Copy(msgID, fallbackText string) error {
 		req.Force = "text"
 	}
 	resp, err := c.roundtrip(req)
+	if err != nil {
+		return err
+	}
+	if resp.Kind == ipc.RespErr {
+		return errors.New(resp.Message)
+	}
+	return nil
+}
+
+func (c *ipcClient) Clear(all bool) error {
+	resp, err := c.roundtrip(&ipc.Request{Op: ipc.OpClear, All: all})
 	if err != nil {
 		return err
 	}

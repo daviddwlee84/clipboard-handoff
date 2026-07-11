@@ -17,6 +17,9 @@ import (
 // acted upon; the rest are stored for forward-compatibility.
 type Settings struct {
 	AutoCopy        string `json:"auto_copy"`         // notify | on | off
+	SaveDir         string `json:"save_dir"`          // folder sink: received image/file items (SPEC §3)
+	TextFile        string `json:"text_file"`         // append sink: received text items (SPEC §3)
+	ClearOnExit     string `json:"clear_on_exit"`     // ask | transient | all | never (SPEC §8)
 	DeviceName      string `json:"device_name"`       // shown to peers
 	Room            string `json:"room"`              // default room/topic
 	Internet        string `json:"internet"`          // on | off (Phase 3)
@@ -30,6 +33,9 @@ func defaultSettings() Settings {
 	}
 	return Settings{
 		AutoCopy:        "notify",
+		SaveDir:         "",
+		TextFile:        "",
+		ClearOnExit:     "ask",
 		DeviceName:      host,
 		Room:            "default",
 		Internet:        "off",
@@ -121,6 +127,17 @@ func (s *Store) SetKey(key, value string) error {
 			return fmt.Errorf("auto_copy must be notify|on|off, got %q", value)
 		}
 		s.settings.AutoCopy = value
+	case "save_dir":
+		s.settings.SaveDir = value
+	case "text_file":
+		s.settings.TextFile = value
+	case "clear_on_exit":
+		switch value {
+		case "ask", "transient", "all", "never":
+		default:
+			return fmt.Errorf("clear_on_exit must be ask|transient|all|never, got %q", value)
+		}
+		s.settings.ClearOnExit = value
 	case "device_name":
 		s.settings.DeviceName = value
 	case "room":
@@ -141,6 +158,12 @@ func (s *Store) GetKey(key string) (string, error) {
 	switch key {
 	case "auto_copy":
 		return cur.AutoCopy, nil
+	case "save_dir":
+		return cur.SaveDir, nil
+	case "text_file":
+		return cur.TextFile, nil
+	case "clear_on_exit":
+		return cur.ClearOnExit, nil
 	case "device_name":
 		return cur.DeviceName, nil
 	case "room":

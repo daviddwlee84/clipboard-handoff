@@ -10,6 +10,7 @@ require (
 	github.com/charmbracelet/ssh v0.0.0-20250826160808-ebfa259c7309
 	github.com/charmbracelet/wish v1.4.7
 	github.com/fxamacker/cbor/v2 v2.9.2
+	github.com/mattn/go-isatty v0.0.20
 	github.com/oklog/ulid/v2 v2.1.1
 	golang.design/x/clipboard v0.8.0
 	golang.org/x/crypto v0.54.0
@@ -34,7 +35,6 @@ require (
 	github.com/go-logfmt/logfmt v0.6.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/muesli/ansi v0.0.0-20230316100256-276c6243b2f6 // indirect

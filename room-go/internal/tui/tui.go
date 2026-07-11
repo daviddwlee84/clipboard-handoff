@@ -70,6 +70,9 @@ type model struct {
 	toast      string
 	toastUntil time.Time
 
+	receivedCount int  // received (non-mine) items this TUI session (SPEC §8 quit)
+	quitting      bool // showing the clear-on-quit prompt
+
 	lineStarts   []int // vp-content start line of each bubble (for scroll-to-selection)
 	contentLines int   // total lines in the current vp content
 }
@@ -239,6 +242,7 @@ func (m model) onItem(item *ipc.Item) model {
 	if item == nil {
 		return m
 	}
+	m.receivedCount++
 	atBottom := m.vp.AtBottom()
 	accepted := m.status.AutoCopy != "notify" // notify mode needs an explicit copy
 	m.bubbles = append(m.bubbles, bubble{item: *item, mine: false, accepted: accepted})
@@ -254,15 +258,60 @@ func (m model) onItem(item *ipc.Item) model {
 }
 
 func (m model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// The clear-on-quit prompt (SPEC §8) captures keys until resolved.
+	if m.quitting {
+		return m.onKeyQuitPrompt(msg)
+	}
 	switch msg.String() {
 	case "ctrl+c":
-		return m, tea.Quit
+		return m.maybeQuit()
 	}
 
 	if m.focused {
 		return m.onKeyCompose(msg)
 	}
 	return m.onKeyBrowse(msg)
+}
+
+// maybeQuit shows the clear-on-quit prompt when something was received this
+// session (SPEC §8), else quits immediately.
+func (m model) maybeQuit() (tea.Model, tea.Cmd) {
+	if m.anythingReceived() {
+		m.quitting = true
+		m.rebuild(false)
+		return m, nil
+	}
+	return m, tea.Quit
+}
+
+// anythingReceived reports whether this session received any item — either
+// observed live in the TUI, or already sitting in the daemon buffer.
+func (m model) anythingReceived() bool {
+	return m.receivedCount > 0 || m.status.Buffer > 0
+}
+
+// onKeyQuitPrompt handles the "clear this session?" choice before exiting. The
+// clear runs on the daemon (SPEC §8) via the same logic as `room clear`.
+func (m model) onKeyQuitPrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "t":
+		return m, tea.Sequence(m.clearCmd(false), tea.Quit)
+	case "a":
+		return m, tea.Sequence(m.clearCmd(true), tea.Quit)
+	case "n", "esc", "q":
+		return m, tea.Quit
+	case "ctrl+c":
+		return m, tea.Quit // force quit without clearing
+	}
+	return m, nil // ignore other keys while the prompt is up
+}
+
+// clearCmd asks the daemon to clear this session (transient, or all incl sinks).
+func (m model) clearCmd(all bool) tea.Cmd {
+	return func() tea.Msg {
+		_ = m.client.Clear(all)
+		return nil
+	}
 }
 
 // onKeyCompose handles keys while the composer is focused.
@@ -303,7 +352,7 @@ func (m model) onKeyCompose(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) onKeyBrowse(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q":
-		return m, tea.Quit
+		return m.maybeQuit()
 	case "i", "a", "enter":
 		m.focused = true
 		m.rebuild(false)

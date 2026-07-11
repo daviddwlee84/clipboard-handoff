@@ -26,8 +26,9 @@ type Request struct {
 	Op         string `cbor:"op"`
 
 	// send
-	Bytes []byte `cbor:"bytes,omitempty"` // raw stdin; daemon sniffs
-	Force string `cbor:"force,omitempty"` // "", "text", or "image" (--text/--image)
+	Bytes    []byte `cbor:"bytes,omitempty"`    // raw stdin/file; daemon sniffs
+	Force    string `cbor:"force,omitempty"`    // "", "text", "image", or "file"
+	Filename string `cbor:"filename,omitempty"` // image/file: name from PATH/--name
 
 	// recv
 	Kind   string `cbor:"kind,omitempty"`   // any | text | image
@@ -37,6 +38,12 @@ type Request struct {
 	// daemon. MsgID selects a received item; empty MsgID with Bytes copies inline
 	// content (e.g. the TUI's own outgoing text); both empty copies the latest.
 	MsgID string `cbor:"msg_id,omitempty"`
+
+	// clear / daemon stop (SPEC §8): All also reverts session sink writes;
+	// Scope is the resolved clear_on_exit policy the client passes to daemon stop
+	// ("never" | "transient" | "all").
+	All   bool   `cbor:"all,omitempty"`
+	Scope string `cbor:"scope,omitempty"`
 
 	// config
 	Key   string `cbor:"key,omitempty"`
@@ -48,16 +55,18 @@ type Request struct {
 
 // Operation names.
 const (
-	OpSend      = "send"
-	OpRecv      = "recv"
-	OpPaste     = "paste"
-	OpCopy      = "copy"
-	OpSubscribe = "subscribe"
-	OpStatus    = "status"
-	OpConfigSet = "config_set"
-	OpConfigGet = "config_get"
-	OpJoin      = "join"
-	OpPing      = "ping"
+	OpSend       = "send"
+	OpRecv       = "recv"
+	OpPaste      = "paste"
+	OpCopy       = "copy"
+	OpSubscribe  = "subscribe"
+	OpStatus     = "status"
+	OpConfigSet  = "config_set"
+	OpConfigGet  = "config_get"
+	OpJoin       = "join"
+	OpClear      = "clear"
+	OpDaemonStop = "daemon_stop"
+	OpPing       = "ping"
 )
 
 // Item is a received clipboard item surfaced to a client (PROTOCOL §4 Event).

@@ -31,6 +31,78 @@ Go 1.26, cgo required for the clipboard backend.
   we wrote, and never re-broadcast a received item.
 - **Images are PNG on the wire** with a **BLAKE3** integrity hash verified on
   receipt. Text rides inline.
+- **Arbitrary files on the wire** (`type=file`) — any bytes, with a `filename`
+  and best-effort MIME (guessed from the extension, else
+  `application/octet-stream`). Content-addressed and BLAKE3-verified like an
+  image, but **never** clipboard-pasteable as an image; `paste` of a file copies
+  its path as clipboard *text*.
+- **Additive sinks** (SPEC §3) — a received item can fan out to the clipboard
+  **and** a folder/append-file, chosen by type (see below).
+- **Sessions & clearing** (SPEC §8) — `clear` / `daemon stop` / TUI-quit can
+  revert what a session left behind (see below).
+
+### Sending a file
+
+```sh
+# from a PATH (the basename becomes the filename), forced to a file item:
+$BIN "${A[@]}" send report.pdf --file
+# or from stdin with an explicit name:
+cat archive.tgz | $BIN "${A[@]}" send --file --name archive.tgz
+```
+
+Type selection follows PROTOCOL §2: `--auto` (default) sniffs — PNG/JPEG magic →
+image, valid UTF-8 → text, otherwise → **file**. `--file` forces a file even for
+UTF-8 input; `--image`/`--text` force those. A `PATH` argument (or `--name`)
+supplies the `filename`.
+
+On the receiver, `recv --emit-path` writes an image/file to a temp path and
+prints it; `paste` puts the latest item on the clipboard (a file's *path* as
+text).
+
+### Sinks — where received items land (`save_dir` / `text_file`)
+
+Independently of the clipboard/`auto_copy` setting, a received item is routed by
+type:
+
+- **text** → clipboard (per `auto_copy`) **and**, if `text_file` is set, appended
+  to that file, each entry preceded by a `\n---\n<device> <ISO8601 ts>\n` header.
+- **image** → clipboard (per `auto_copy`) **and**, if `save_dir` is set, written
+  there as `<filename>` (or `<hash>.png`), de-duplicated `name (2).ext` on
+  collision.
+- **file** → if `save_dir` is set, written there as `<filename>` (or `<hash>`),
+  de-duplicated; **never** the clipboard.
+
+```sh
+$BIN "${B[@]}" config set save_dir  ~/Drop     # folder sink (image/file)
+$BIN "${B[@]}" config set text_file ~/room.log # append sink (text)
+```
+
+### Sessions & clearing (privacy, SPEC §8)
+
+A **session** is one daemon run. It tracks, so a clear is precise and never
+destructive beyond the session:
+
+- the **transient** store — the fetched-blob cache, `recv --emit-path` temp
+  files, and the in-memory received-items buffer (always safe to clear);
+- the **`text_file` size at session start** (the truncation offset);
+- the **list of files written into `save_dir`** this session.
+
+```sh
+$BIN "${B[@]}" clear              # transient only (buffer + blob cache)
+$BIN "${B[@]}" clear --all        # + revert session sinks (prompts unless --yes)
+$BIN "${B[@]}" clear --all --yes  # non-interactive
+```
+
+`clear --all` truncates `text_file` back to its session-start offset (removing
+only what this session appended) and deletes the files this session wrote into
+`save_dir` — pre-session content is untouched.
+
+`room daemon stop` shuts the daemon down applying `clear_on_exit`
+(`never` / `transient` / `all` / `ask`); `ask` prompts on a TTY, else falls back
+to `transient`. A SIGTERM applies the same policy non-interactively. In
+`room tui`, quitting (`q`/`Ctrl-C`) after receiving anything shows a small prompt
+— *clear this session? [t]ransient / [a]ll incl sinks / [n]o* — and runs the same
+clear before exiting.
 
 ### Phase 0 simplifications (documented, per the task brief)
 
@@ -103,12 +175,14 @@ $BIN "${A[@]}" daemon --foreground --server room@localhost:$PORT
 | `room server [--addr :2222] [--host-key PATH] [--authorized-keys FILE]` | run the SSH room server |
 | `room daemon [--foreground] [--server user@host:port]` | run the client daemon (usually auto-spawned) |
 | `room join <user@host:port>` | generate/print the client key fingerprint, connect the daemon to a server+room |
-| `room send [--text\|--image\|--auto]` | read stdin, sniff type, broadcast |
-| `room recv [--follow] [--latest-image --emit-path] [--out PATH]` | text→stdout, image→file path |
+| `room send [PATH] [--text\|--image\|--file\|--auto] [--name NAME]` | read PATH or stdin, sniff type, broadcast |
+| `room recv [--follow] [--latest-image --emit-path] [--out PATH]` | text→stdout, image/file→file path |
 | `room tui` | messenger-style chat attached to the local daemon (SPEC §4) |
-| `room paste` | write the latest received item to the OS clipboard |
+| `room paste` | write the latest received item to the OS clipboard (a file's path as text) |
+| `room clear [--all] [--yes]` | clear this session's transient store; `--all` also reverts session sinks (§8) |
+| `room daemon stop` | shut the daemon down, applying `clear_on_exit` (§8) |
 | `room status [--json]` | identity / room / server / connected / auto_copy / buffer |
-| `room config set KEY VALUE` · `room config get KEY` | `auto_copy`, `device_name`, `room`, `server`, … (SPEC §5) |
+| `room config set KEY VALUE` · `room config get KEY` | `auto_copy`, `save_dir`, `text_file`, `clear_on_exit`, `device_name`, `room`, `server`, … (SPEC §5) |
 
 Global flags (before the subcommand): `--config-dir PATH`, `--socket PATH`,
 `--room NAME`, `--json`, `-q/--quiet`, `-v/--verbose`. Exit codes follow SPEC §2
@@ -150,8 +224,8 @@ Two modes; `Esc` toggles between them.
 | browse | `s` | save the selected image to `~/Downloads` (or cwd) |
 | browse | `o` | open the selected image externally (`open`/`xdg-open`) |
 | browse | `i` / `Enter` | return to the composer |
-| any | `Ctrl-C` | quit |
-| browse | `q` | quit |
+| any | `Ctrl-C` | quit (prompts to clear the session if anything was received) |
+| browse | `q` | quit (same clear prompt) |
 
 In `auto_copy notify` mode (the default), received items are **not** written to
 the clipboard automatically — each bubble shows a `press y to copy` nudge and a
@@ -206,7 +280,7 @@ cmd/room/            CLI: global-flag parsing + subcommand dispatch
 internal/wire/       Envelope, CBOR codec, length-prefixed framing, type-sniff, BLAKE3   (+ tests)
 internal/broker/     server-side per-room fan-out (adapted from sshbbs broker)           (+ tests)
 internal/server/     charmbracelet/wish SSH server + pubkey auth + relay handler
-internal/daemon/     resident agent: SSH conn, ring buffer, IPC, auto-copy, dedupe       (+ tests)
+internal/daemon/     resident agent: SSH conn, ring buffer, IPC, auto-copy, dedupe, sinks + session/clear (§3/§8)   (+ tests)
 internal/ipc/        client<->daemon request/response types, framing, dial + auto-spawn
 internal/tui/        messenger-style chat (`room tui`): bubbletea model, IPC client, Subscribe stream  (+ test)
 internal/config/     config dir, config.json (SPEC §5), SSH identity key
@@ -215,11 +289,31 @@ internal/clip/       golang.design/x/clipboard wrapper (lazy init; text + PNG)
 
 ## Tests
 
-- `internal/wire`: envelope CBOR round-trip (text + image, incl. inline blob),
-  type-sniff (PNG/JPEG/UTF-8/invalid), PNG passthrough preserves bytes, JPEG→PNG
-  transcode, frame round-trip.
+- `internal/wire`: envelope CBOR round-trip (text + image + **file**, incl.
+  inline blob), unknown-field tolerance (wire back-compat), type-sniff
+  (PNG/JPEG/UTF-8/invalid) and `Classify`/`MimeForFilename` (the `--auto`
+  file/text/image decision + MIME guess), PNG passthrough preserves bytes,
+  JPEG→PNG transcode, frame round-trip.
 - `internal/broker`: fan-out excludes the sender, room isolation, unregister
   cleanup, and a `-race` concurrency stress.
-- `internal/daemon`: `msg_id` dedupe / echo-suppression + bounded eviction.
+- `internal/daemon`: `msg_id` dedupe / echo-suppression + bounded eviction;
+  **sinks** (text append with header, image/file to `save_dir` with dedup);
+  **`clear --all`** truncates `text_file` to the session-start offset and removes
+  only this-session `save_dir` files (pre-session content untouched); `clipContent`
+  type routing (a file copies its path as text).
 - `internal/tui`: bubbletea model `Update` — an incoming-item message appends a
-  bubble; submitting the composer yields a daemon send; `y` copies by `msg_id`.
+  bubble; submitting the composer yields a daemon send; `y` copies by `msg_id`;
+  the **quit-clear prompt** appears only after something was received and its
+  `t`/`a`/`n` answers drive the daemon clear.
+
+## End-to-end (sinks + clear)
+
+`scripts/e2e_sinks.sh` drives the full flow through a live server: two daemons,
+`save_dir` + `text_file` on the receiver, sends a text + an image + a small
+arbitrary binary, asserts the folder + append-file contents and hash-equality,
+then `clear --all --yes` and asserts the session sink writes reverted while
+pre-session content is intact, and finally `daemon stop`.
+
+```sh
+bash scripts/e2e_sinks.sh
+```

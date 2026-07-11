@@ -133,6 +133,8 @@ func (m model) renderBubble(b bubble, selected bool) string {
 	switch env.Type {
 	case wire.TypeImage:
 		body = m.renderImageBody(b)
+	case wire.TypeFile:
+		body = m.renderFileBody(b)
 	default:
 		body = env.Text
 	}
@@ -181,6 +183,26 @@ func (m model) renderImageBody(b bubble) string {
 	return head + "\n" + hint
 }
 
+// renderFileBody renders a file item: name + size, plus its landing path. A
+// file has no clipboard image form; `y` copies its path as text (SPEC §2).
+func (m model) renderFileBody(b bubble) string {
+	env := b.item.Envelope
+	name := env.Filename
+	if name == "" && b.item.LocalPath != "" {
+		name = filepath.Base(b.item.LocalPath)
+	}
+	if name == "" {
+		name = "file"
+	}
+	var size string
+	if env.Blob != nil {
+		size = " · " + humanSize(env.Blob.Size)
+	}
+	head := fmt.Sprintf("📄  %s%s", name, size)
+	hint := metaStyle.Render("[file — y copy path · s save · o open]")
+	return head + "\n" + hint
+}
+
 // ---- top-level view ----
 
 func (m model) View() string {
@@ -221,6 +243,10 @@ func (m model) renderHeader() string {
 }
 
 func (m model) renderToast() string {
+	if m.quitting {
+		return toastStyle.Inline(true).MaxWidth(m.width).Render(
+			"⚑ clear this session? [t]ransient / [a]ll incl sinks / [n]o")
+	}
 	if m.toast != "" {
 		return toastStyle.Inline(true).MaxWidth(m.width).Render("⚑ " + m.toast)
 	}
@@ -248,7 +274,9 @@ func (m model) renderComposer() string {
 
 func (m model) renderHint() string {
 	var h string
-	if m.focused {
+	if m.quitting {
+		h = "t transient · a all incl sinks · n no · ctrl+c force quit"
+	} else if m.focused {
 		h = "enter send · esc browse · ctrl+c quit"
 	} else {
 		h = "j/k select · y copy · s save · o open · g/G top/bottom · i compose · q quit"

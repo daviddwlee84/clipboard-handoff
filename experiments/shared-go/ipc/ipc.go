@@ -29,30 +29,36 @@ type Request struct {
 	Op         string `cbor:"op"`
 
 	// send
-	Bytes []byte `cbor:"bytes,omitempty"` // raw stdin; daemon sniffs
-	Force string `cbor:"force,omitempty"` // "", "text", or "image" (--text/--image)
+	Bytes []byte `cbor:"bytes,omitempty"` // raw stdin / file bytes; daemon sniffs
+	Force string `cbor:"force,omitempty"` // "", "text", "image", or "file"
+	Name  string `cbor:"name,omitempty"`  // filename for image/file items (PATH/--name)
 
 	// recv
-	Kind   string `cbor:"kind,omitempty"`   // any | text | image
+	Kind   string `cbor:"kind,omitempty"`   // any | text | image | file
 	Follow bool   `cbor:"follow,omitempty"` // stream until closed
+
+	// clear
+	All bool `cbor:"all,omitempty"` // clear --all: also revert this session's sink writes
 
 	// config
 	Key   string `cbor:"key,omitempty"`
-	Value string `cbor:"value,omitempty"`
+	Value string `cbor:"value,omitempty"` // also carries the resolved clear_on_exit policy for daemon_stop
 }
 
 // Operation names.
 const (
-	OpSend      = "send"
-	OpRecv      = "recv"
-	OpPaste     = "paste"
-	OpCopy      = "copy" // write arbitrary client-supplied bytes to the OS clipboard (TUI `y`)
-	OpSubscribe = "subscribe"
-	OpStatus    = "status"
-	OpPeers     = "peers"
-	OpConfigSet = "config_set"
-	OpConfigGet = "config_get"
-	OpPing      = "ping"
+	OpSend       = "send"
+	OpRecv       = "recv"
+	OpPaste      = "paste"
+	OpCopy       = "copy" // write arbitrary client-supplied bytes to the OS clipboard (TUI `y`)
+	OpClear      = "clear"
+	OpSubscribe  = "subscribe"
+	OpStatus     = "status"
+	OpPeers      = "peers"
+	OpConfigSet  = "config_set"
+	OpConfigGet  = "config_get"
+	OpDaemonStop = "daemon_stop"
+	OpPing       = "ping"
 )
 
 // Item is a received clipboard item surfaced to a client (PROTOCOL §4 Event).

@@ -38,6 +38,7 @@ type tuiClient interface {
 	Send(force string, data []byte) error // broadcast an item (OpSend)
 	Copy(force string, data []byte) error // write bytes to the OS clipboard (OpCopy)
 	Paste() error                         // copy the daemon's latest item (OpPaste)
+	Clear(all bool) error                 // clear this session (OpClear); all also reverts sinks
 	Status() (*ipc.Status, error)         // header snapshot (OpStatus)
 }
 
@@ -83,6 +84,10 @@ func (c *ipcClient) Copy(force string, data []byte) error {
 
 func (c *ipcClient) Paste() error {
 	return c.simple(&ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpPaste})
+}
+
+func (c *ipcClient) Clear(all bool) error {
+	return c.simple(&ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpClear, All: all})
 }
 
 func (c *ipcClient) Status() (*ipc.Status, error) {
@@ -156,6 +161,7 @@ type bubble struct {
 	ts     time.Time
 
 	isImage  bool
+	isFile   bool
 	text     string
 	w, h     int
 	size     uint64
@@ -175,6 +181,9 @@ type tuiModel struct {
 	bubbles         []bubble
 	selected        int // index into bubbles; -1 when empty
 	composerFocused bool
+
+	gotItem        bool // received at least one item this session (drives the quit clear prompt)
+	confirmingQuit bool // showing the "clear this session? [t]/[a]/[n]" prompt
 
 	ta     textarea.Model
 	vp     viewport.Model
@@ -304,9 +313,30 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While the quit-clear prompt is up (SPEC §8), intercept the choice keys.
+	// The clear runs synchronously here (we are quitting anyway) so it is
+	// guaranteed to complete before the program exits.
+	if m.confirmingQuit {
+		switch msg.String() {
+		case "t":
+			_ = m.client.Clear(false)
+			return m, tea.Quit
+		case "a":
+			_ = m.client.Clear(true)
+			return m, tea.Quit
+		case "n":
+			return m, tea.Quit
+		case "esc":
+			m.confirmingQuit = false // cancel: back to the chat
+			return m, nil
+		default:
+			return m, nil // ignore other keys until a choice is made
+		}
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
-		return m, tea.Quit
+		return m.requestQuit()
 	case "esc":
 		m.toggleFocus()
 		return m, nil
@@ -331,7 +361,7 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Browse mode: navigate + per-item actions.
 	switch msg.String() {
 	case "q":
-		return m, tea.Quit
+		return m.requestQuit()
 	case "up", "k":
 		m.moveSelection(-1)
 		return m, nil
@@ -362,6 +392,17 @@ func (m tuiModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
 	return m, cmd
+}
+
+// requestQuit implements the SPEC §8 TUI-quit clear decision: if anything was
+// received this session, raise the "clear this session? [t]/[a]/[n]" prompt and
+// stay open until the user chooses; otherwise quit immediately.
+func (m tuiModel) requestQuit() (tea.Model, tea.Cmd) {
+	if m.gotItem {
+		m.confirmingQuit = true
+		return m, nil
+	}
+	return m, tea.Quit
 }
 
 func (m *tuiModel) toggleFocus() {
@@ -404,6 +445,7 @@ func (m *tuiModel) appendOwnText(text string) {
 
 func (m *tuiModel) appendItem(it *ipc.Item) {
 	env := &it.Envelope
+	m.gotItem = true // something was received this session (SPEC §8 quit prompt)
 	wasLast := m.selected == len(m.bubbles)-1
 	b := bubble{sender: senderLabel(env), ts: time.UnixMilli(int64(env.TS))}
 	if env.Type == wire.TypeImage && env.Blob != nil {
@@ -412,6 +454,14 @@ func (m *tuiModel) appendItem(it *ipc.Item) {
 		b.size = env.Blob.Size
 		b.path = it.LocalPath
 		b.filename = shortHash(env.Blob.Hash) + ".png"
+	} else if env.Type == wire.TypeFile && env.Blob != nil {
+		b.isFile = true
+		b.size = env.Blob.Size
+		b.path = it.LocalPath
+		b.filename = env.Filename
+		if b.filename == "" {
+			b.filename = shortHash(env.Blob.Hash)
+		}
 	} else {
 		b.text = env.Text
 	}
@@ -442,6 +492,10 @@ func (m tuiModel) copySelected() tea.Cmd {
 	if b.isImage {
 		return copyImage(m.client, b.path)
 	}
+	if b.isFile {
+		// A file has no clipboard image form (SPEC §3): copy its path as text.
+		return copyText(m.client, b.path)
+	}
 	return copyText(m.client, b.text)
 }
 
@@ -455,8 +509,8 @@ func (m tuiModel) saveSelected() tea.Cmd {
 
 func (m tuiModel) openSelected() tea.Cmd {
 	b, ok := m.currentBubble()
-	if !ok || !b.isImage {
-		return func() tea.Msg { return openedMsg{err: errors.New("selected item is not an image")} }
+	if !ok || (!b.isImage && !b.isFile) {
+		return func() tea.Msg { return openedMsg{err: errors.New("selected item has no file to open")} }
 	}
 	return openExternal(b.path)
 }
@@ -544,6 +598,9 @@ func (m *tuiModel) renderBubble(b bubble, selected bool) string {
 	if b.isImage {
 		body = fmt.Sprintf("🖼  %s  %d×%d · %s", b.filename, b.w, b.h, humanSize(b.size))
 		body += "\n" + dimStyle.Render("[y] copy · [s] save · [o] open   (inline preview: stubbed)")
+	} else if b.isFile {
+		body = fmt.Sprintf("📎  %s · %s", b.filename, humanSize(b.size))
+		body += "\n" + dimStyle.Render("[p] copy path · [o] open   (files land in save_dir; no clipboard image)")
 	} else {
 		body = wrap(b.text, m.vp.Width-4)
 	}
@@ -584,6 +641,11 @@ func (m tuiModel) composerView() string {
 }
 
 func (m tuiModel) renderHint() string {
+	if m.confirmingQuit {
+		return hintStyle.Width(m.width).Render(
+			toastStyle.Render("clear this session before quitting?") +
+				dimStyle.Render("  [t] transient · [a] all incl sinks · [n] no · Esc cancel"))
+	}
 	var h string
 	if m.composerFocused {
 		h = "Enter send · Esc browse · Ctrl-C quit"

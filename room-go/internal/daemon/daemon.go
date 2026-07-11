@@ -16,7 +16,6 @@ import (
 	"github.com/charmbracelet/log"
 	gossh "golang.org/x/crypto/ssh"
 
-	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/clip"
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/config"
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/ipc"
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/wire"
@@ -41,7 +40,11 @@ type Daemon struct {
 	subs     map[chan *ipc.Item]struct{}
 	lastCopy string // BLAKE3 of the last value we wrote to our own clipboard (SPEC §3 rule 2)
 
-	done chan struct{}
+	sess *session // per-session sink/transient tracking for `clear` (SPEC §8)
+
+	done     chan struct{}
+	stopReq  chan struct{} // closed by `daemon stop` to trigger shutdown
+	stopOnce sync.Once
 }
 
 // New builds a daemon. room overrides the configured room when non-empty.
@@ -66,7 +69,9 @@ func New(cfg *config.Store, socketPath, room string) (*Daemon, error) {
 		deviceName: settings.DeviceName,
 		dedupe:     NewDedupe(4096),
 		subs:       make(map[chan *ipc.Item]struct{}),
+		sess:       newSession(settings.TextFile),
 		done:       make(chan struct{}),
+		stopReq:    make(chan struct{}),
 	}
 	return d, nil
 }
@@ -93,8 +98,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go d.connectLoop(target)
 	}
 
+	// Shutdown watcher: either a SIGTERM/SIGINT (ctx) or an IPC `daemon stop`.
+	// A `daemon stop` has already applied its resolved clear scope in the
+	// handler; a signal applies the clear_on_exit policy non-interactively here
+	// (SPEC §8: SIGTERM → policy, ask falls back to transient).
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+			d.applyClearOnExit(d.cfg.Get().ClearOnExit, false)
+		case <-d.stopReq:
+			// clear already applied by handleDaemonStop
+		}
 		close(d.done)
 		ln.Close()
 	}()
@@ -122,13 +136,21 @@ func (d *Daemon) ingest(env *wire.Envelope) {
 
 	item := &ipc.Item{Envelope: *env}
 
-	if env.Type == wire.TypeImage {
-		// Integrity check (PROTOCOL §1): blob.hash MUST be verified on receipt.
+	// Image and file are content-addressed blobs: verify BLAKE3 (PROTOCOL §1)
+	// and materialize into the transient blob cache so `recv --emit-path`,
+	// `paste`, and the folder sink have bytes/paths to work with.
+	if env.Type == wire.TypeImage || env.Type == wire.TypeFile {
 		if env.Blob == nil || wire.HashHex(env.BlobData) != env.Blob.Hash {
-			log.Warn("image integrity check failed; dropping", "msg_id", env.MsgID)
+			log.Warn("blob integrity check failed; dropping", "msg_id", env.MsgID, "type", env.Type)
 			return
 		}
-		path := filepath.Join(d.cfg.BlobDir(), env.Blob.Hash+".png")
+		name := env.Blob.Hash
+		if env.Type == wire.TypeImage {
+			name += ".png"
+		} else {
+			name += fileExt(env.Filename)
+		}
+		path := filepath.Join(d.cfg.BlobDir(), name)
 		if err := os.WriteFile(path, env.BlobData, 0o600); err != nil {
 			log.Warn("write blob", "err", err)
 			return
@@ -155,11 +177,16 @@ func (d *Daemon) ingest(env *wire.Envelope) {
 		}
 	}
 
+	// Additive sinks (SPEC §3): folder/append-file, independent of auto_copy.
+	d.routeSinks(item)
+	// Clipboard sink, governed by auto_copy.
 	d.applyAutoCopy(item)
 }
 
-// applyAutoCopy enforces SPEC §3. Phase 0 trusts all senders (allowlist/TOFU
-// is Phase 1); the mode still governs whether we touch the clipboard.
+// applyAutoCopy enforces the clipboard sink of SPEC §3. Phase 0 trusts all
+// senders (allowlist/TOFU is Phase 1); the mode still governs whether we touch
+// the clipboard. A `file` is never auto-copied (it has no clipboard image
+// form); `paste`/`y` copy its path as text on demand.
 func (d *Daemon) applyAutoCopy(item *ipc.Item) {
 	mode := d.cfg.Get().AutoCopy
 	env := &item.Envelope
@@ -169,22 +196,14 @@ func (d *Daemon) applyAutoCopy(item *ipc.Item) {
 	}
 	switch mode {
 	case "on":
-		var err error
-		var hash string
-		if env.Type == wire.TypeText {
-			hash = wire.HashHex([]byte(env.Text))
-			err = clip.WriteText(env.Text)
-		} else if env.Type == wire.TypeImage {
-			hash = env.Blob.Hash
-			err = clip.WritePNG(env.BlobData)
+		if env.Type == wire.TypeFile {
+			// files never hit the clipboard automatically (SPEC §3)
+			return
 		}
-		if err != nil {
+		if err := d.writeClipboard(item); err != nil {
 			log.Warn("auto_copy on: clipboard write failed", "err", err)
 			return
 		}
-		d.mu.Lock()
-		d.lastCopy = hash // SPEC §3 rule 2: remember what we wrote
-		d.mu.Unlock()
 		log.Info("auto-copied to clipboard", "from", label, "type", env.Type)
 	case "off":
 		// never touch the clipboard
@@ -198,8 +217,13 @@ func (d *Daemon) applyAutoCopy(item *ipc.Item) {
 // subscriber. A desktop notification is a Phase 1 nicety.
 func (d *Daemon) notify(env *wire.Envelope, label string) {
 	preview := env.Text
-	if env.Type == wire.TypeImage && env.Blob != nil {
-		preview = "image " + itoa(int(env.Blob.W)) + "x" + itoa(int(env.Blob.H))
+	switch env.Type {
+	case wire.TypeImage:
+		if env.Blob != nil {
+			preview = "image " + itoa(int(env.Blob.W)) + "x" + itoa(int(env.Blob.H))
+		}
+	case wire.TypeFile:
+		preview = "file " + fileLabel(env)
 	}
 	log.Info("received (notify)", "from", label, "type", env.Type, "preview", truncate(preview, 40))
 }

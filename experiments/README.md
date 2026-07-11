@@ -21,11 +21,11 @@ writes a transport:
 
 | Package | Responsibility |
 |---|---|
-| `shared-go/wire` | Envelope + CBOR codec + length-prefixed framing + type-sniff (PNG/JPEG/UTF-8, JPEG→PNG) + BLAKE3 (PROTOCOL §1–2) |
+| `shared-go/wire` | Envelope + CBOR codec + length-prefixed framing + type-sniff (PNG/JPEG/UTF-8, JPEG→PNG, else `file`) + best-effort file MIME + BLAKE3 (PROTOCOL §1–2) |
 | `shared-go/ipc` | Local Unix-socket IPC: length-prefixed CBOR request/response + event stream, daemon auto-spawn (PROTOCOL §4) |
-| `shared-go/config` | Config dir + `config.json` settings (SPEC §5); hands each transport a path for its identity key |
+| `shared-go/config` | Config dir + `config.json` settings (SPEC §5: `auto_copy`, `save_dir`, `text_file`, `clear_on_exit`, …); hands each transport a path for its identity key |
 | `shared-go/clip` | OS clipboard via `golang.design/x/clipboard` (text + PNG) |
-| `shared-go/daemon` | Ring buffer, `msg_id` dedupe + last-written-hash echo suppression, auto-copy (`notify`/`on`/`off`), IPC handlers |
+| `shared-go/daemon` | Ring buffer, `msg_id` dedupe + last-written-hash echo suppression, auto-copy (`notify`/`on`/`off`), the additive folder/append-file **sinks** + per-**session** tracking & clearing (SPEC §3, §8), IPC handlers |
 | `shared-go/cli` | The whole CLI surface (SPEC §2), parameterized by an `App{BinName, NewTransport}` |
 | `shared-go/transport` | The pluggable contract: `Identity()`, `Start(ctx)`, `Broadcast(env)`, `OnReceive(fn)`, `Peers()`, `Close()` |
 
@@ -60,7 +60,64 @@ lets them auto-discover over mDNS, then verifies `send --text` A→B and
 `send --image` A→B (BLAKE3 hash-equal). Discovery is automatic, so the harness's
 default `start_pair()` hook works unchanged — see each probe README.
 
-## Messenger TUI (`BIN tui`)
+## Sending files, sinks & clearing (SPEC §2, §3, §8)
+
+These are shared by both probes (they live in `shared-go`), so `lan` and
+`libp2p-mesh` behave identically.
+
+**Send anything.** `send` reads a `PATH` (or **stdin** to EOF) and sniffs the
+type: PNG/JPEG magic → **image**; valid UTF-8 → **text**; otherwise → **file**
+(arbitrary bytes, best-effort MIME from the extension, else
+`application/octet-stream`). Force with `--text` / `--image` / `--file`; a
+file/image carries its `filename` from the `PATH` basename or `--name`.
+
+```sh
+lan send report.pdf                 # → file (filename report.pdf)
+lan send --file blob.bin --name x   # force file, override the filename
+cat notes.txt | lan send            # stdin → text (valid UTF-8)
+lan send shot.png                   # → image (PNG/JPEG only; JPEG transcoded to PNG)
+```
+
+Only an **image** is clipboard-pasteable as an image; a **file** has no
+clipboard image form — `paste`/`recv --emit-path` give you its path, and `paste`
+copies that **path as clipboard text**. Blobs ride inline (`blob_data`, Phase 0)
+and their BLAKE3 `blob.hash` is verified on receipt.
+
+**Additive sinks.** A received item can fan out to more than the clipboard,
+chosen by type (all subject to the same echo/loop suppression):
+
+```sh
+lan config set save_dir  ~/Drop     # received image/file items are written here
+lan config set text_file ~/clip.md  # received text is appended here
+```
+
+- text → clipboard (per `auto_copy`) **and**, if `text_file` set, appended after
+  a `\n---\n<device> <ISO8601 ts>\n` header.
+- image → clipboard (per `auto_copy`) **and**, if `save_dir` set, written as
+  `<filename or hash>.png` (de-duplicated `name (2).png`).
+- file → if `save_dir` set, written as `<filename or hash>` (de-duplicated);
+  never the clipboard.
+
+**Sessions & clearing.** The daemon tracks, per session, the transient store
+(blob cache + `recv --emit-path` temp files + in-memory buffer), the `text_file`
+size at session start, and the `save_dir` files it wrote — so a clear is precise
+and never destructive beyond the session:
+
+```sh
+lan clear                # transient only (blob cache, emit temp files, buffer)
+lan clear --all          # + revert this session's sinks (prompts unless --yes)
+lan clear --all --yes    # truncate text_file to session-start; delete this
+                         # session's save_dir files; pre-session content untouched
+lan daemon stop          # shut the daemon down, applying clear_on_exit
+lan config set clear_on_exit ask|transient|all|never   # default: ask
+```
+
+`clear_on_exit` runs on `daemon stop` / SIGTERM: `never` keeps everything,
+`transient` purges transient, `all` also reverts session sinks, `ask` prompts on
+a TTY (via `daemon stop`) else falls back to `transient`. The **TUI** raises the
+same decision on quit (below).
+
+
 
 A lean, messenger-style chat attached to the local daemon (SPEC §4). It lives in
 `shared-go/cli` (bubbletea + lipgloss + bubbles), so **both probes get the same
@@ -84,18 +141,19 @@ marked `(you)`) · composer (textarea) · keybinding hint line.
 | type + `Enter` | send the line as a text item (own bubble appears immediately) |
 | `Esc` | toggle focus between composer and browse mode |
 | `↑`/`k`, `↓`/`j` | move the selection in browse mode (`g`/`G` = top/bottom) |
-| `y` | copy the highlighted bubble (or latest) to the OS clipboard **via the daemon** |
+| `y` | copy the highlighted bubble to the OS clipboard **via the daemon** (a file copies its path as text) |
 | `s` | save a highlighted image to `~/Downloads` (else temp dir) |
-| `o` | open a highlighted image with the OS default app |
+| `o` | open a highlighted image/file with the OS default app |
 | `p` | paste the daemon's latest received item to the clipboard |
-| `q` / `Ctrl-C` | quit |
+| `q` / `Ctrl-C` | quit — if anything was received this session, first prompt *clear this session? `[t]`ransient / `[a]`ll incl sinks / `[n]`o* and run it before exit (SPEC §8) |
 
 Incoming items appear live. `auto_copy` mode is shown in the header and honored
-by the daemon (the TUI is front-end only). **Stubbed:** inline image previews —
-image bubbles show a metadata placeholder (`🖼 <hash>.png W×H · size`) plus
-copy/save/open actions, not a Kitty/iTerm2/Sixel thumbnail; the composer is
-text-only (no image paste); and history starts empty (only items received while
-the TUI is open are shown — the daemon has no bulk-buffer-replay op).
+by the daemon (the TUI is front-end only). File bubbles render a `📎 name · size`
+placeholder (files land in `save_dir`; no clipboard image). **Stubbed:** inline
+image previews — image bubbles show a metadata placeholder (`🖼 <hash>.png W×H ·
+size`) plus copy/save/open actions, not a Kitty/iTerm2/Sixel thumbnail; the
+composer is text-only (no image paste); and history starts empty (only items
+received while the TUI is open are shown — the daemon has no bulk-buffer-replay op).
 
 Visual check on a real terminal: run `bin/lan tui` on two machines (or two
 `--config-dir`/`--socket` pairs on one host) in the same `--room`, type on one,
@@ -112,5 +170,5 @@ watch the bubble arrive on the other; select it and press `y`, then confirm with
 ## Unit tests
 
 ```sh
-cd experiments/shared-go && go test ./...   # wire codec, sniff, framing, dedupe, TUI model
+cd experiments/shared-go && go test ./...   # wire codec/sniff/framing (incl. file envelope), dedupe, sinks + session clear, TUI model
 ```

@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -37,6 +39,8 @@ func (d *Daemon) handleConn(c net.Conn) {
 		d.handlePaste(c)
 	case ipc.OpCopy:
 		d.handleCopy(c, req)
+	case ipc.OpClear:
+		d.handleClear(c, req)
 	case ipc.OpSubscribe:
 		d.handleSubscribe(c, "any")
 	case ipc.OpStatus, ipc.OpPeers:
@@ -45,6 +49,8 @@ func (d *Daemon) handleConn(c net.Conn) {
 		d.handleConfigSet(c, req)
 	case ipc.OpConfigGet:
 		d.handleConfigGet(c, req)
+	case ipc.OpDaemonStop:
+		d.handleDaemonStop(c, req)
 	default:
 		_ = ipc.WriteResp(c, errResp(2, "unknown op: "+req.Op))
 	}
@@ -64,49 +70,36 @@ func (d *Daemon) handleSend(c net.Conn, req *ipc.Request) {
 		TS:         uint64(time.Now().UnixMilli()),
 	}
 
-	asImage := false
+	// Determine the type (PROTOCOL §2). --text/--image/--file force it; --auto
+	// (default) sniffs: PNG/JPEG magic → image; valid UTF-8 → text; else file.
 	switch req.Force {
 	case "text":
 		env.Type = wire.TypeText
 		env.Mime = wire.MimeText
 		env.Text = string(req.Bytes)
 	case "image":
-		asImage = true
-	default:
-		kind, serr := wire.Sniff(req.Bytes)
-		if serr != nil {
+		if serr := fillImage(env, req.Bytes, req.Name); serr != nil {
 			_ = ipc.WriteResp(c, errResp(2, serr.Error()))
 			return
 		}
-		if kind == wire.KindText {
+	case "file":
+		fillFile(env, req.Bytes, req.Name)
+	default: // auto
+		kind, serr := wire.Sniff(req.Bytes)
+		switch {
+		case serr == nil && (kind == wire.KindPNG || kind == wire.KindJPEG):
+			if ferr := fillImage(env, req.Bytes, req.Name); ferr != nil {
+				_ = ipc.WriteResp(c, errResp(1, ferr.Error()))
+				return
+			}
+		case serr == nil && kind == wire.KindText:
 			env.Type = wire.TypeText
 			env.Mime = wire.MimeText
 			env.Text = string(req.Bytes)
-		} else {
-			asImage = true
+		default:
+			// Binary, non-image → file with a best-effort mime (PROTOCOL §2).
+			fillFile(env, req.Bytes, req.Name)
 		}
-	}
-
-	if asImage {
-		kind, serr := wire.Sniff(req.Bytes)
-		if serr != nil || (kind != wire.KindPNG && kind != wire.KindJPEG) {
-			_ = ipc.WriteResp(c, errResp(2, "not a supported image (PNG/JPEG)"))
-			return
-		}
-		png, perr := wire.ToPNG(kind, req.Bytes) // canonical wire format is PNG
-		if perr != nil {
-			_ = ipc.WriteResp(c, errResp(1, perr.Error()))
-			return
-		}
-		w, h, derr := wire.PNGDims(png)
-		if derr != nil {
-			_ = ipc.WriteResp(c, errResp(1, "decode png dims: "+derr.Error()))
-			return
-		}
-		env.Type = wire.TypeImage
-		env.Mime = wire.MimePNG
-		env.Blob = &wire.Blob{Hash: wire.HashHex(png), Size: uint64(len(png)), W: w, H: h}
-		env.BlobData = png // Phase 0: inline (PROTOCOL §1 blob_data)
 	}
 
 	// SPEC §3: mark our own msg_id seen before broadcasting so a transport that
@@ -132,6 +125,39 @@ func (d *Daemon) handleSend(c net.Conn, req *ipc.Request) {
 		return
 	}
 	_ = ipc.WriteResp(c, okResp())
+}
+
+// fillImage populates env as an image: sniff (must be PNG/JPEG), transcode to
+// the canonical PNG wire format, and set the blob + inline bytes + filename.
+func fillImage(env *wire.Envelope, data []byte, filename string) error {
+	kind, serr := wire.Sniff(data)
+	if serr != nil || (kind != wire.KindPNG && kind != wire.KindJPEG) {
+		return errors.New("not a supported image (PNG/JPEG)")
+	}
+	png, perr := wire.ToPNG(kind, data) // canonical wire format is PNG
+	if perr != nil {
+		return perr
+	}
+	w, h, derr := wire.PNGDims(png)
+	if derr != nil {
+		return fmt.Errorf("decode png dims: %w", derr)
+	}
+	env.Type = wire.TypeImage
+	env.Mime = wire.MimePNG
+	env.Filename = filename
+	env.Blob = &wire.Blob{Hash: wire.HashHex(png), Size: uint64(len(png)), W: w, H: h}
+	env.BlobData = png // Phase 0: inline (PROTOCOL §1 blob_data)
+	return nil
+}
+
+// fillFile populates env as an arbitrary file: best-effort mime from the
+// extension, inline content-addressed bytes, and the advisory filename.
+func fillFile(env *wire.Envelope, data []byte, filename string) {
+	env.Type = wire.TypeFile
+	env.Mime = wire.MimeForFile(filename)
+	env.Filename = filename
+	env.Blob = &wire.Blob{Hash: wire.HashHex(data), Size: uint64(len(data))}
+	env.BlobData = data // Phase 0: inline (PROTOCOL §1 blob_data)
 }
 
 func (d *Daemon) handleRecv(c net.Conn, req *ipc.Request) {
@@ -239,8 +265,13 @@ func (d *Daemon) handleConfigSet(c net.Conn, req *ipc.Request) {
 		_ = ipc.WriteResp(c, errResp(2, err.Error()))
 		return
 	}
-	if req.Key == "device_name" {
+	switch req.Key {
+	case "device_name":
 		d.deviceName = req.Value
+	case "text_file":
+		// Capture the new sink's session-start offset so a later clear --all
+		// truncates to here, not to before it was configured (SPEC §8).
+		d.recordTextBaseline(req.Value)
 	}
 	_ = ipc.WriteResp(c, okResp())
 }
@@ -274,25 +305,60 @@ func (d *Daemon) waitForPeers(max time.Duration) bool {
 }
 
 // writeClipboard writes an item to the OS clipboard and records its content
-// hash for echo suppression (SPEC §3 rule 2).
+// hash for echo suppression (SPEC §3 rule 2). A file has no image clipboard
+// form — its local path is copied as text instead (SPEC §2 `paste`).
 func (d *Daemon) writeClipboard(item *ipc.Item) error {
-	env := &item.Envelope
-	var hash string
+	isImage, data := clipboardPayload(item)
 	var err error
-	if env.Type == wire.TypeText {
-		hash = wire.HashHex([]byte(env.Text))
-		err = clip.WriteText(env.Text)
+	if isImage {
+		err = clip.WritePNG(data)
 	} else {
-		hash = env.Blob.Hash
-		err = clip.WritePNG(env.BlobData)
+		err = clip.WriteText(string(data))
 	}
 	if err != nil {
 		return err
 	}
 	d.mu.Lock()
-	d.lastCopy = hash
+	d.lastCopy = wire.HashHex(data)
 	d.mu.Unlock()
 	return nil
+}
+
+// clipboardPayload decides what bytes a paste places on the clipboard, and
+// whether they are an image (SPEC §2/§3): text → the text; image → the PNG
+// bytes; file → its materialized path, copied as clipboard text.
+func clipboardPayload(item *ipc.Item) (isImage bool, data []byte) {
+	env := &item.Envelope
+	switch env.Type {
+	case wire.TypeImage:
+		return true, env.BlobData
+	case wire.TypeFile:
+		return false, []byte(item.LocalPath)
+	default:
+		return false, []byte(env.Text)
+	}
+}
+
+// handleClear reverts this session's data (SPEC §8). Transient by default; --all
+// also reverts session sink writes. The client owns the confirmation prompt.
+func (d *Daemon) handleClear(c net.Conn, req *ipc.Request) {
+	d.clear(req.All)
+	log.Printf("clear (all=%v) applied via IPC", req.All)
+	_ = ipc.WriteResp(c, okResp())
+}
+
+// handleDaemonStop applies the resolved clear_on_exit policy on shutdown and
+// tears the daemon down (SPEC §8). The client resolves "ask" (TTY prompt →
+// t/a/n, else transient) and passes the concrete policy in req.Value.
+func (d *Daemon) handleDaemonStop(c net.Conn, req *ipc.Request) {
+	d.mu.Lock()
+	d.stopPolicy = req.Value
+	d.mu.Unlock()
+	_ = ipc.WriteResp(c, okResp())
+	log.Printf("daemon stop requested (policy=%q)", req.Value)
+	if d.cancel != nil {
+		d.cancel() // triggers Run to return; applyExitPolicy runs on the way out
+	}
 }
 
 // ---- small helpers ----

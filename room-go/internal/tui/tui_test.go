@@ -14,6 +14,7 @@ import (
 type fakeClient struct {
 	sent   []string
 	copies []copyCall
+	clears []bool // Clear(all) calls, in order
 	status *ipc.Status
 }
 
@@ -25,6 +26,7 @@ func (f *fakeClient) Copy(msgID, fallback string) error {
 	f.copies = append(f.copies, copyCall{msgID, fallback})
 	return nil
 }
+func (f *fakeClient) Clear(all bool) error { f.clears = append(f.clears, all); return nil }
 
 func asModel(t *testing.T, tm tea.Model) model {
 	t.Helper()
@@ -132,5 +134,75 @@ func TestUpdate_CopyByMsgID(t *testing.T) {
 	cmd() // executes the copy
 	if len(fc.copies) != 1 || fc.copies[0].msgID != "msg-42" {
 		t.Errorf("copies = %+v, want one copy of msg-42", fc.copies)
+	}
+}
+
+func runeKey(r rune) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}} }
+
+// Quitting with nothing received exits immediately (no clear prompt).
+func TestQuit_ImmediateWhenNothingReceived(t *testing.T) {
+	m := newModel(Options{}, &fakeClient{})
+	m.focused = false // browse mode so `q` means quit
+
+	out, cmd := m.Update(runeKey('q'))
+	got := asModel(t, out)
+	if got.quitting {
+		t.Fatalf("should not prompt when nothing was received")
+	}
+	if cmd == nil {
+		t.Fatal("expected a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", cmd())
+	}
+}
+
+// Quitting after receiving an item shows the clear prompt instead of quitting.
+func TestQuit_PromptsWhenReceived(t *testing.T) {
+	m := newModel(Options{}, &fakeClient{})
+	out, _ := m.Update(itemMsg{item: &ipc.Item{Envelope: wire.Envelope{Type: wire.TypeText, Text: "hi", MsgID: "m1"}}})
+	m = asModel(t, out)
+	m.focused = false
+
+	out, cmd := m.Update(runeKey('q'))
+	got := asModel(t, out)
+	if !got.quitting {
+		t.Fatalf("expected the clear-on-quit prompt to appear")
+	}
+	if cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Fatalf("should not quit yet — the prompt must be answered first")
+		}
+	}
+}
+
+// Answering the prompt with 'n' quits without clearing.
+func TestQuit_PromptDeclineDoesNotClear(t *testing.T) {
+	fc := &fakeClient{}
+	m := newModel(Options{}, fc)
+	m.quitting = true
+
+	out, cmd := m.Update(runeKey('n'))
+	_ = asModel(t, out)
+	if cmd == nil {
+		t.Fatal("expected a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("expected tea.QuitMsg, got %T", cmd())
+	}
+	if len(fc.clears) != 0 {
+		t.Fatalf("declining should not clear, got clears=%v", fc.clears)
+	}
+}
+
+// clearCmd(true/false) asks the daemon to clear the session (all vs transient).
+func TestQuit_ClearCmdCallsDaemon(t *testing.T) {
+	fc := &fakeClient{}
+	m := newModel(Options{}, fc)
+
+	m.clearCmd(true)()
+	m.clearCmd(false)()
+	if len(fc.clears) != 2 || fc.clears[0] != true || fc.clears[1] != false {
+		t.Fatalf("clears = %v, want [true false]", fc.clears)
 	}
 }

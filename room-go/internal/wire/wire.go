@@ -13,6 +13,9 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"mime"
+	"path/filepath"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/fxamacker/cbor/v2"
@@ -27,42 +30,47 @@ const Version uint16 = 1
 // (~210 KiB). 32 MiB leaves headroom without inviting abuse.
 const MaxFrame = 32 << 20
 
-// Blob is the content-addressed reference for an image (PROTOCOL §1). In
-// Phase 0 the PNG bytes ride inline in Envelope.BlobData; Phase 1 replaces
-// that with a server-side pull keyed by Hash.
+// Blob is the content-addressed reference for an image or file (PROTOCOL §1).
+// In Phase 0 the bytes ride inline in Envelope.BlobData; Phase 1 replaces that
+// with a server-side pull keyed by Hash. W/H are set for images only.
 type Blob struct {
-	Hash string `cbor:"hash"` // BLAKE3 hex of the PNG bytes — also the integrity check
-	Size uint64 `cbor:"size"` // PNG byte length
-	W    uint32 `cbor:"w"`
-	H    uint32 `cbor:"h"`
+	Hash string `cbor:"hash"` // BLAKE3 hex of the bytes — also the integrity check
+	Size uint64 `cbor:"size"` // byte length
+	W    uint32 `cbor:"w"`    // image only
+	H    uint32 `cbor:"h"`    // image only
 }
 
-// Envelope is the on-the-wire message (PROTOCOL §1). Encoded as CBOR.
+// Envelope is the on-the-wire message (PROTOCOL §1). Encoded as CBOR. Unknown
+// fields are ignored on decode, so a newer field (e.g. filename) stays wire
+// back-compatible with an older peer.
 type Envelope struct {
 	V          uint16 `cbor:"v"`
 	MsgID      string `cbor:"msg_id"` // ULID — the dedupe key
-	Type       string `cbor:"type"`   // "text" | "image"
+	Type       string `cbor:"type"`   // "text" | "image" | "file"
 	Mime       string `cbor:"mime"`
 	Sender     string `cbor:"sender"` // stable peer identity: SSH public-key fingerprint
 	DeviceName string `cbor:"device_name"`
-	TS         uint64 `cbor:"ts"` // unix milliseconds at the sender
+	TS         uint64 `cbor:"ts"`                 // unix milliseconds at the sender
+	Filename   string `cbor:"filename,omitempty"` // image/file: original name, advisory (folder/save sinks)
 
 	Text string `cbor:"text,omitempty"` // type=text: inline UTF-8 payload
-	Blob *Blob  `cbor:"blob,omitempty"` // type=image: content-addressed reference
+	Blob *Blob  `cbor:"blob,omitempty"` // type=image|file: content-addressed reference
 
-	// BlobData carries the PNG bytes inline. This is a documented Phase 0
+	// BlobData carries the image/file bytes inline. This is a documented Phase 0
 	// simplification (SPEC §7 / task brief allow inline relay of small test
-	// images). PNG is the canonical wire format regardless (PROTOCOL §1).
+	// blobs). PNG stays the canonical wire format for images (PROTOCOL §1).
 	BlobData []byte `cbor:"blob_data,omitempty"`
 }
 
 const (
 	TypeText  = "text"
 	TypeImage = "image"
+	TypeFile  = "file"
 
-	MimeText = "text/plain; charset=utf-8"
-	MimePNG  = "image/png"
-	MimeJPEG = "image/jpeg"
+	MimeText  = "text/plain; charset=utf-8"
+	MimePNG   = "image/png"
+	MimeJPEG  = "image/jpeg"
+	MimeOctet = "application/octet-stream"
 )
 
 // Marshal encodes an Envelope to CBOR.
@@ -123,7 +131,7 @@ const (
 )
 
 // Sniff classifies raw stdin bytes (PROTOCOL §2). PNG/JPEG magic → image;
-// else valid UTF-8 → text; else an error (caller maps to exit code 2).
+// else valid UTF-8 → text; else an error (caller maps to file, or exit 2).
 func Sniff(b []byte) (Kind, error) {
 	if bytes.HasPrefix(b, pngMagic) {
 		return KindPNG, nil
@@ -135,6 +143,37 @@ func Sniff(b []byte) (Kind, error) {
 		return KindText, nil
 	}
 	return 0, errors.New("unrecognized content: not PNG, JPEG, or valid UTF-8")
+}
+
+// Classify decides the wire Type for raw bytes under the `--auto` rules
+// (PROTOCOL §2): PNG/JPEG magic → image; else `--file` (forceFile) → file;
+// else valid UTF-8 → text; else (binary) → file. It never errors — arbitrary
+// binary is a valid file.
+func Classify(b []byte, forceFile bool) string {
+	if bytes.HasPrefix(b, pngMagic) || bytes.HasPrefix(b, jpegMagic) {
+		return TypeImage
+	}
+	if forceFile {
+		return TypeFile
+	}
+	if utf8.Valid(b) {
+		return TypeText
+	}
+	return TypeFile
+}
+
+// MimeForFilename returns a best-effort MIME type for a file, guessed from the
+// filename extension (PROTOCOL §1: "best-effort for files"), falling back to
+// application/octet-stream when unknown.
+func MimeForFilename(name string) string {
+	if ext := filepath.Ext(name); ext != "" {
+		if t := mime.TypeByExtension(ext); t != "" {
+			// mime.TypeByExtension may append "; charset=utf-8"; keep it as-is,
+			// it is advisory. Trim any trailing whitespace only.
+			return strings.TrimSpace(t)
+		}
+	}
+	return MimeOctet
 }
 
 // ToPNG normalizes image bytes to the canonical PNG wire format. PNG passes

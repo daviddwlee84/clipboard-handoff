@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"syscall"
 
 	"github.com/charmbracelet/log"
+	"github.com/mattn/go-isatty"
 
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/broker"
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/config"
@@ -67,6 +69,8 @@ func dispatch(g Globals, sub string, args []string) int {
 		return cmdRecv(g, args)
 	case "paste":
 		return cmdPaste(g, args)
+	case "clear":
+		return cmdClear(g, args)
 	case "tui":
 		return cmdTui(g, args)
 	case "status":
@@ -231,6 +235,11 @@ func trustLabel(allowed map[string]bool) string {
 // ---- daemon ----------------------------------------------------------------
 
 func cmdDaemon(g Globals, args []string) int {
+	// `daemon stop` is a thin client op (SPEC §2), not a way to run the daemon.
+	if len(args) > 0 && args[0] == "stop" {
+		return cmdDaemonStop(g, args[1:])
+	}
+
 	fs := newFlagSet("daemon")
 	_ = fs.bool("foreground", false, "run in the foreground (default when launched directly)")
 	serverTarget := fs.string("server", "", "server user@host:port to connect to")
@@ -321,26 +330,51 @@ func cmdSend(g Globals, args []string) int {
 	fs := newFlagSet("send")
 	asText := fs.bool("text", false, "force text")
 	asImage := fs.bool("image", false, "force image (PNG/JPEG)")
+	asFile := fs.bool("file", false, "force file (arbitrary bytes)")
+	name := fs.string("name", "", "filename for an image/file item")
 	_ = fs.bool("auto", false, "sniff type (default)")
 	if code := fs.parse(args); code != 0 {
 		return code
 	}
 
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return fail(1, err)
+	// Read from a PATH argument if given, else stdin (SPEC §2). A PATH also
+	// supplies the default filename (advisory; used by folder/save sinks).
+	var (
+		data     []byte
+		err      error
+		filename string
+	)
+	if pos := fs.args(); len(pos) > 0 {
+		path := pos[0]
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return fail(1, err)
+		}
+		filename = filepath.Base(path)
+	} else {
+		data, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			return fail(1, err)
+		}
+	}
+	if *name != "" {
+		filename = *name
 	}
 	if len(data) == 0 {
-		return fail(2, errors.New("send: empty stdin"))
-	}
-	force := ""
-	if *asText {
-		force = "text"
-	} else if *asImage {
-		force = "image"
+		return fail(2, errors.New("send: empty input"))
 	}
 
-	resp, code := roundtrip(g, &ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpSend, Bytes: data, Force: force})
+	force := ""
+	switch {
+	case *asText:
+		force = "text"
+	case *asImage:
+		force = "image"
+	case *asFile:
+		force = "file"
+	}
+
+	resp, code := roundtrip(g, &ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpSend, Bytes: data, Force: force, Filename: filename})
 	if code != 0 {
 		return code
 	}
@@ -407,7 +441,7 @@ func cmdRecv(g Globals, args []string) int {
 	return 0
 }
 
-// printItem renders one item to stdout: text inline; image as a file path
+// printItem renders one item to stdout: text inline; image/file as a file path
 // (copied to --out first if requested).
 func printItem(resp *ipc.Response, emitPath bool, out string) {
 	if resp.Kind != ipc.RespItem || resp.Item == nil {
@@ -418,7 +452,7 @@ func printItem(resp *ipc.Response, emitPath bool, out string) {
 		fmt.Println(env.Text)
 		return
 	}
-	// image
+	// image or file: materialized to a local path
 	path := resp.Item.LocalPath
 	if out != "" && path != "" {
 		if err := copyFile(path, out); err == nil {
@@ -427,9 +461,21 @@ func printItem(resp *ipc.Response, emitPath bool, out string) {
 	}
 	if emitPath || out != "" {
 		fmt.Println(path)
-	} else {
-		fmt.Printf("[image %dx%d %s]\n", env.Blob.W, env.Blob.H, path)
+		return
 	}
+	if env.Type == "file" {
+		var size uint64
+		if env.Blob != nil {
+			size = env.Blob.Size
+		}
+		name := env.Filename
+		if name == "" {
+			name = filepath.Base(path)
+		}
+		fmt.Printf("[file %s %d bytes %s]\n", name, size, path)
+		return
+	}
+	fmt.Printf("[image %dx%d %s]\n", env.Blob.W, env.Blob.H, path)
 }
 
 // ---- paste -----------------------------------------------------------------
@@ -446,6 +492,144 @@ func cmdPaste(g Globals, args []string) int {
 		fmt.Println("pasted latest item to clipboard")
 	}
 	return 0
+}
+
+// ---- clear -----------------------------------------------------------------
+
+func cmdClear(g Globals, args []string) int {
+	fs := newFlagSet("clear")
+	all := fs.bool("all", false, "also revert this session's sink writes (text_file + save_dir)")
+	yes := fs.bool("yes", false, "skip the confirmation prompt")
+	if code := fs.parse(args); code != 0 {
+		return code
+	}
+
+	doSinks := false
+	if *all {
+		switch {
+		case *yes:
+			doSinks = true
+		case isTTY(os.Stdin):
+			doSinks = promptYesNo("clear this session's sink writes (text_file + save_dir)? [y/N] ")
+		default:
+			fmt.Fprintln(os.Stderr, "room: clear --all needs --yes when non-interactive; clearing transient only")
+		}
+	}
+
+	resp, code := roundtrip(g, &ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpClear, All: doSinks})
+	if code != 0 {
+		return code
+	}
+	if resp.Kind == ipc.RespErr {
+		return fail(resp.Code, errors.New(resp.Message))
+	}
+	if !g.Quiet {
+		if doSinks {
+			fmt.Println("cleared session (transient + sinks)")
+		} else {
+			fmt.Println("cleared session (transient)")
+		}
+	}
+	return 0
+}
+
+// ---- daemon stop -----------------------------------------------------------
+
+func cmdDaemonStop(g Globals, args []string) int {
+	fs := newFlagSet("daemon stop")
+	if code := fs.parse(args); code != 0 {
+		return code
+	}
+
+	// Do NOT auto-spawn a daemon just to stop it.
+	sock, err := g.socketPath()
+	if err != nil {
+		return fail(1, err)
+	}
+	conn, derr := ipc.Dial(sock, false, nil)
+	if derr != nil {
+		if !g.Quiet {
+			fmt.Fprintln(os.Stderr, "room: no daemon running")
+		}
+		return 0
+	}
+	defer conn.Close()
+
+	// Resolve the clear_on_exit policy (SPEC §8): `ask` prompts on a TTY, else
+	// falls back to transient. The resolved scope is passed to the daemon.
+	scope := resolveClearOnExit(g)
+
+	if err := ipc.WriteReq(conn, &ipc.Request{IPCVersion: ipc.IPCVersion, Op: ipc.OpDaemonStop, Scope: scope}); err != nil {
+		return fail(3, err)
+	}
+	resp, err := ipc.ReadResp(conn)
+	if err != nil {
+		return fail(3, err)
+	}
+	if resp.Kind == ipc.RespErr {
+		return fail(resp.Code, errors.New(resp.Message))
+	}
+	if !g.Quiet {
+		fmt.Printf("daemon stopped (clear: %s)\n", scope)
+	}
+	return 0
+}
+
+// resolveClearOnExit reads the clear_on_exit policy and turns `ask` into a
+// concrete scope: prompt on a TTY, else transient (SPEC §8).
+func resolveClearOnExit(g Globals) string {
+	policy := "ask"
+	if cfg, err := openConfig(g); err == nil {
+		if p := cfg.Get().ClearOnExit; p != "" {
+			policy = p
+		}
+	}
+	if policy != "ask" {
+		return policy
+	}
+	if !isTTY(os.Stdin) {
+		return "transient"
+	}
+	switch promptChoice("clear this session on exit? [t]ransient / [a]ll incl sinks / [n]o: ", "tan") {
+	case "a":
+		return "all"
+	case "n":
+		return "never"
+	default:
+		return "transient"
+	}
+}
+
+// isTTY reports whether f is an interactive terminal (avoids a prompt in a
+// pipeline or when stdin is /dev/null).
+func isTTY(f *os.File) bool {
+	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
+}
+
+// promptYesNo reads a y/N answer from stdin (default no).
+func promptYesNo(prompt string) bool {
+	fmt.Fprint(os.Stderr, prompt)
+	r := bufio.NewReader(os.Stdin)
+	line, _ := r.ReadString('\n')
+	line = strings.ToLower(strings.TrimSpace(line))
+	return line == "y" || line == "yes"
+}
+
+// promptChoice reads a single-letter answer restricted to the runes in allowed;
+// it returns the first matching lowercase letter, or "" on no/invalid input.
+func promptChoice(prompt, allowed string) string {
+	fmt.Fprint(os.Stderr, prompt)
+	r := bufio.NewReader(os.Stdin)
+	line, _ := r.ReadString('\n')
+	line = strings.ToLower(strings.TrimSpace(line))
+	if line == "" {
+		return ""
+	}
+	c := string(line[0])
+	if strings.Contains(allowed, c) {
+		return c
+	}
+	return ""
 }
 
 // ---- status ----------------------------------------------------------------
@@ -609,10 +793,12 @@ Global flags:
 Commands:
   server   [--addr :2222] [--host-key PATH] [--authorized-keys FILE]
   daemon   [--foreground] [--server user@host:port]
+  daemon stop
   join     <user@host:port>
-  send     [--text|--image|--auto]        (reads stdin)
+  send     [PATH] [--text|--image|--file|--auto] [--name NAME]   (PATH or stdin)
   recv     [--follow] [--latest-image --emit-path] [--out PATH]
   paste
+  clear    [--all] [--yes]
   tui                                     (messenger-style chat)
   status   [--json]
   config   set KEY VALUE | get KEY
