@@ -51,6 +51,11 @@ func WritePNG(png []byte) error {
 	return nil
 }
 
+// Available reports whether the OS clipboard can be initialized on this host.
+// It is used by `status`/the TUI header to show clipboard: available|unavailable
+// without taking ownership of the selection (ownership happens only on Write).
+func Available() bool { return ensure() == nil }
+
 // ReadText reads the current clipboard text (unused in Phase 0 beyond
 // completeness; broadcast_on_copy watching is Phase 3).
 func ReadText() (string, error) {

@@ -22,6 +22,7 @@ import (
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/daemon"
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/ipc"
 	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/server"
+	"github.com/daviddwlee84/cross-platform-copy/room-go/internal/tui"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -66,6 +67,8 @@ func dispatch(g Globals, sub string, args []string) int {
 		return cmdRecv(g, args)
 	case "paste":
 		return cmdPaste(g, args)
+	case "tui":
+		return cmdTui(g, args)
 	case "status":
 		return cmdStatus(g, args)
 	case "peers":
@@ -457,8 +460,8 @@ func cmdStatus(g Globals, args []string) int {
 	}
 	s := resp.Status
 	if g.JSON {
-		fmt.Printf(`{"fingerprint":%q,"device_name":%q,"room":%q,"server":%q,"connected":%t,"auto_copy":%q,"peers":%d,"buffer":%d}`+"\n",
-			s.Fingerprint, s.DeviceName, s.Room, s.Server, s.Connected, s.AutoCopy, s.Peers, s.Buffer)
+		fmt.Printf(`{"fingerprint":%q,"device_name":%q,"room":%q,"server":%q,"connected":%t,"auto_copy":%q,"peers":%d,"buffer":%d,"clipboard":%t}`+"\n",
+			s.Fingerprint, s.DeviceName, s.Room, s.Server, s.Connected, s.AutoCopy, s.Peers, s.Buffer, s.Clipboard)
 		return 0
 	}
 	fmt.Printf("identity:   %s\n", s.Fingerprint)
@@ -467,8 +470,16 @@ func cmdStatus(g Globals, args []string) int {
 	fmt.Printf("server:     %s\n", s.Server)
 	fmt.Printf("connected:  %t\n", s.Connected)
 	fmt.Printf("auto_copy:  %s\n", s.AutoCopy)
+	fmt.Printf("clipboard:  %s\n", clipboardLabel(s.Clipboard))
 	fmt.Printf("buffer:     %d item(s)\n", s.Buffer)
 	return 0
+}
+
+func clipboardLabel(ok bool) string {
+	if ok {
+		return "available"
+	}
+	return "unavailable"
 }
 
 // ---- config ----------------------------------------------------------------
@@ -506,6 +517,27 @@ func cmdConfig(g Globals, args []string) int {
 	default:
 		return fail(2, fmt.Errorf("config: unknown action %q", args[0]))
 	}
+}
+
+// ---- tui --------------------------------------------------------------------
+
+func cmdTui(g Globals, args []string) int {
+	fs := newFlagSet("tui")
+	if code := fs.parse(args); code != 0 {
+		return code
+	}
+	sock, err := g.socketPath()
+	if err != nil {
+		return fail(1, err)
+	}
+	if err := tui.Run(tui.Options{
+		SocketPath: sock,
+		SpawnArgs:  g.spawnArgs(),
+		Room:       g.Room,
+	}); err != nil {
+		return fail(1, err)
+	}
+	return 0
 }
 
 // ---- shared client plumbing ------------------------------------------------
@@ -581,6 +613,7 @@ Commands:
   send     [--text|--image|--auto]        (reads stdin)
   recv     [--follow] [--latest-image --emit-path] [--out PATH]
   paste
+  tui                                     (messenger-style chat)
   status   [--json]
   config   set KEY VALUE | get KEY
 `)

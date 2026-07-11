@@ -23,7 +23,8 @@ Go 1.26, cgo required for the clipboard backend.
   keeps a ring buffer of received items, and serves thin clients over a local
   Unix-socket IPC (PROTOCOL §4: length-prefixed CBOR, `Subscribe` event stream).
   Auto-spawned by the first client command.
-- **Thin clients**: `send` · `recv` · `paste` · `status` · `config` · `join`.
+- **Thin clients**: `send` · `recv` · `paste` · `status` · `config` · `join` ·
+  `tui` (a messenger-style chat, see below).
 - **Auto-copy** default `notify` (received items are surfaced but the clipboard
   is *not* written until `paste`); `on` writes immediately; `off` never touches
   it. Echo/loop suppression: dedupe by `msg_id`, remember the last content-hash
@@ -104,6 +105,7 @@ $BIN "${A[@]}" daemon --foreground --server room@localhost:$PORT
 | `room join <user@host:port>` | generate/print the client key fingerprint, connect the daemon to a server+room |
 | `room send [--text\|--image\|--auto]` | read stdin, sniff type, broadcast |
 | `room recv [--follow] [--latest-image --emit-path] [--out PATH]` | text→stdout, image→file path |
+| `room tui` | messenger-style chat attached to the local daemon (SPEC §4) |
 | `room paste` | write the latest received item to the OS clipboard |
 | `room status [--json]` | identity / room / server / connected / auto_copy / buffer |
 | `room config set KEY VALUE` · `room config get KEY` | `auto_copy`, `device_name`, `room`, `server`, … (SPEC §5) |
@@ -112,6 +114,67 @@ Global flags (before the subcommand): `--config-dir PATH`, `--socket PATH`,
 `--room NAME`, `--json`, `-q/--quiet`, `-v/--verbose`. Exit codes follow SPEC §2
 (`0` ok · `2` usage · `3` no daemon · `4` no peers/not connected — a send
 warning · `5` nothing to paste/recv).
+
+## The messenger TUI (`room tui`)
+
+`room tui` is a full-screen chat front-end (charmbracelet **bubbletea +
+lipgloss + bubbles**) attached to the local daemon. It auto-spawns/connects the
+daemon if needed, then **Subscribes** to the daemon's IPC event stream (the same
+stream `recv --follow` uses) and renders incoming items live. It is a
+front-end, not a second clipboard owner: the `y` copy action asks the **daemon**
+(the clipboard owner) to place the item on the OS clipboard, honoring the
+`auto_copy` mode (notify-first).
+
+```sh
+# after `join` (or with a server configured), on either device:
+$BIN "${A[@]}" tui
+```
+
+Layout (top → bottom): a **header** (`room · 🔑fingerprint · connected/server ·
+auto_copy · clipboard: available|unavailable`), a scrollable **message history**
+of chat bubbles (`sender · relative-time · body`, your own messages
+right-aligned in green), a status/toast line, a **composer** (textarea), and a
+keybinding **hint** line.
+
+### Keybindings
+
+Two modes; `Esc` toggles between them.
+
+| Mode | Key | Action |
+|---|---|---|
+| compose | type + `Enter` | send the line as a text item (appears as your own bubble) |
+| compose | `Esc` | switch to browse mode |
+| browse | `↑`/`k`, `↓`/`j` | move the message selection (highlighted bubble) |
+| browse | `g` / `G` | jump to oldest / newest |
+| browse | `y` | copy the highlighted (or latest) item to the OS clipboard **via the daemon** |
+| browse | `s` | save the selected image to `~/Downloads` (or cwd) |
+| browse | `o` | open the selected image externally (`open`/`xdg-open`) |
+| browse | `i` / `Enter` | return to the composer |
+| any | `Ctrl-C` | quit |
+| browse | `q` | quit |
+
+In `auto_copy notify` mode (the default), received items are **not** written to
+the clipboard automatically — each bubble shows a `press y to copy` nudge and a
+toast surfaces the incoming item, matching SPEC §3/§4.
+
+### Images
+
+Image items always render a bubble with metadata (`🖼 name  W×H · size`) plus the
+`y`/`s`/`o` affordances. **Inline terminal-graphics rendering (Kitty/iTerm2/
+Sixel) is a documented stub** in Phase 0 — the bubble shows a clear placeholder
+line rather than pixels; copy/save/open all work on the full-resolution PNG the
+daemon materialized. Adding an inline preview later is a drop-in change to
+`renderImageBody` (e.g. via `rasterm`) since the local PNG path is already on
+each image bubble.
+
+### Verifying on a real terminal
+
+bubbletea needs a real TTY, so a non-interactive shell can only drive the model
+headlessly (see `internal/tui/tui_test.go`, which exercises `Update`: an
+incoming item appends a bubble; submitting the composer yields a daemon send; a
+`y` copies by `msg_id`). To see it for real: start the server, `join` two
+daemons to the same room (as above), run `room tui` on each, and type — messages
+appear live on the other side; press `y` on a received bubble to copy it.
 
 ## Wiring the bake-off harness (`scripts/roundtrip.sh`)
 
@@ -145,6 +208,7 @@ internal/broker/     server-side per-room fan-out (adapted from sshbbs broker)  
 internal/server/     charmbracelet/wish SSH server + pubkey auth + relay handler
 internal/daemon/     resident agent: SSH conn, ring buffer, IPC, auto-copy, dedupe       (+ tests)
 internal/ipc/        client<->daemon request/response types, framing, dial + auto-spawn
+internal/tui/        messenger-style chat (`room tui`): bubbletea model, IPC client, Subscribe stream  (+ test)
 internal/config/     config dir, config.json (SPEC §5), SSH identity key
 internal/clip/       golang.design/x/clipboard wrapper (lazy init; text + PNG)
 ```
@@ -157,3 +221,5 @@ internal/clip/       golang.design/x/clipboard wrapper (lazy init; text + PNG)
 - `internal/broker`: fan-out excludes the sender, room isolation, unregister
   cleanup, and a `-race` concurrency stress.
 - `internal/daemon`: `msg_id` dedupe / echo-suppression + bounded eviction.
+- `internal/tui`: bubbletea model `Update` — an incoming-item message appends a
+  bubble; submitting the composer yields a daemon send; `y` copies by `msg_id`.

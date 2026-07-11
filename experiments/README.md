@@ -60,6 +60,48 @@ lets them auto-discover over mDNS, then verifies `send --text` A→B and
 `send --image` A→B (BLAKE3 hash-equal). Discovery is automatic, so the harness's
 default `start_pair()` hook works unchanged — see each probe README.
 
+## Messenger TUI (`BIN tui`)
+
+A lean, messenger-style chat attached to the local daemon (SPEC §4). It lives in
+`shared-go/cli` (bubbletea + lipgloss + bubbles), so **both probes get the same
+TUI**: `lan tui` and `libp2p-mesh tui`. It is a thin client — it reuses the
+daemon's live event stream (the same `Subscribe` op `recv --follow` uses) and
+the `Send`/`Copy`/`Paste`/`Status` IPC ops; it never touches the transport,
+ring buffer or clipboard directly (the daemon owns those).
+
+```sh
+cd experiments/lan-go && go build -o bin/lan ./cmd/lan
+bin/lan --room default tui          # auto-spawns the daemon if it is down
+# another device in the same room:  bin/lan --room default tui
+```
+
+Layout: header (`room · id · peers · auto_copy · clipboard: available|unavailable`)
+· scrollable bubble history (`sender · relative-time · body`, your own messages
+marked `(you)`) · composer (textarea) · keybinding hint line.
+
+| Key | Action |
+|---|---|
+| type + `Enter` | send the line as a text item (own bubble appears immediately) |
+| `Esc` | toggle focus between composer and browse mode |
+| `↑`/`k`, `↓`/`j` | move the selection in browse mode (`g`/`G` = top/bottom) |
+| `y` | copy the highlighted bubble (or latest) to the OS clipboard **via the daemon** |
+| `s` | save a highlighted image to `~/Downloads` (else temp dir) |
+| `o` | open a highlighted image with the OS default app |
+| `p` | paste the daemon's latest received item to the clipboard |
+| `q` / `Ctrl-C` | quit |
+
+Incoming items appear live. `auto_copy` mode is shown in the header and honored
+by the daemon (the TUI is front-end only). **Stubbed:** inline image previews —
+image bubbles show a metadata placeholder (`🖼 <hash>.png W×H · size`) plus
+copy/save/open actions, not a Kitty/iTerm2/Sixel thumbnail; the composer is
+text-only (no image paste); and history starts empty (only items received while
+the TUI is open are shown — the daemon has no bulk-buffer-replay op).
+
+Visual check on a real terminal: run `bin/lan tui` on two machines (or two
+`--config-dir`/`--socket` pairs on one host) in the same `--room`, type on one,
+watch the bubble arrive on the other; select it and press `y`, then confirm with
+`pbpaste` (macOS) / `xclip -o` (Linux).
+
 ## What the probes answer (BAKEOFF)
 
 - **`lan-go`** — is iroh's weight worth it, or is a hand-rolled LAN mesh good
@@ -70,5 +112,5 @@ default `start_pair()` hook works unchanged — see each probe README.
 ## Unit tests
 
 ```sh
-cd experiments/shared-go && go test ./...   # wire codec, sniff, framing, dedupe
+cd experiments/shared-go && go test ./...   # wire codec, sniff, framing, dedupe, TUI model
 ```

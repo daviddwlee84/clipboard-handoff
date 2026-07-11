@@ -224,6 +224,21 @@ func (d *Daemon) bufferLen() int {
 	return len(d.buffer)
 }
 
+// findByID returns a copy of the buffered item with the given msg_id, or nil.
+// Used by the TUI `y` copy action to place a specific received item on the
+// clipboard through the daemon.
+func (d *Daemon) findByID(id string) *ipc.Item {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := len(d.buffer) - 1; i >= 0; i-- {
+		if d.buffer[i].Envelope.MsgID == id {
+			it := *d.buffer[i]
+			return &it
+		}
+	}
+	return nil
+}
+
 func (d *Daemon) subscribe() chan *ipc.Item {
 	ch := make(chan *ipc.Item, 16)
 	d.mu.Lock()

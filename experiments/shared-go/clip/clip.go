@@ -32,6 +32,13 @@ func ensure() (err error) {
 	return initErr
 }
 
+// Available reports whether the OS clipboard can be initialized on this host.
+// It runs the same one-time init as WriteText/WritePNG (so probing does not
+// change later behavior) and surfaces the result for the TUI header (SPEC §4).
+func Available() bool {
+	return ensure() == nil
+}
+
 // WriteText places text on the OS clipboard.
 func WriteText(s string) error {
 	if err := ensure(); err != nil {

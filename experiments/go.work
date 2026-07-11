@@ -5,7 +5,7 @@
 go 1.26.4
 
 use (
-	./shared-go
 	./lan-go
 	./libp2p-mesh
+	./shared-go
 )

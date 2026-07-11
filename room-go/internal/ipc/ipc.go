@@ -33,6 +33,11 @@ type Request struct {
 	Kind   string `cbor:"kind,omitempty"`   // any | text | image
 	Follow bool   `cbor:"follow,omitempty"` // stream until closed
 
+	// copy (TUI `y`): copy a specific buffered item to the OS clipboard via the
+	// daemon. MsgID selects a received item; empty MsgID with Bytes copies inline
+	// content (e.g. the TUI's own outgoing text); both empty copies the latest.
+	MsgID string `cbor:"msg_id,omitempty"`
+
 	// config
 	Key   string `cbor:"key,omitempty"`
 	Value string `cbor:"value,omitempty"`
@@ -46,6 +51,7 @@ const (
 	OpSend      = "send"
 	OpRecv      = "recv"
 	OpPaste     = "paste"
+	OpCopy      = "copy"
 	OpSubscribe = "subscribe"
 	OpStatus    = "status"
 	OpConfigSet = "config_set"
@@ -70,6 +76,7 @@ type Status struct {
 	AutoCopy    string `cbor:"auto_copy"`
 	Peers       int    `cbor:"peers"`
 	Buffer      int    `cbor:"buffer"`
+	Clipboard   bool   `cbor:"clipboard"` // whether the OS clipboard is reachable
 }
 
 // Response is a daemon->client message. Multiple responses may stream on one

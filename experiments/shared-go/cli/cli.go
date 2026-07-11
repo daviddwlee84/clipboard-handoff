@@ -66,6 +66,8 @@ func (g Globals) dispatch(sub string, args []string) int {
 		return g.cmdRecv(args)
 	case "paste":
 		return g.cmdPaste(args)
+	case "tui":
+		return g.cmdTUI(args)
 	case "status":
 		return g.cmdStatus(args)
 	case "peers":
@@ -345,6 +347,9 @@ func (g Globals) cmdStatus(args []string) int {
 	fmt.Printf("room:       %s\n", s.Room)
 	fmt.Printf("transport:  %s\n", s.Transport)
 	fmt.Printf("auto_copy:  %s\n", s.AutoCopy)
+	if s.Clipboard != "" {
+		fmt.Printf("clipboard:  %s\n", s.Clipboard)
+	}
 	fmt.Printf("peers:      %d connected\n", len(s.Peers))
 	for _, p := range s.Peers {
 		fmt.Printf("  - %s  %s  %s\n", p.Name, short(p.ID), p.Addr)
@@ -487,6 +492,7 @@ Commands:
   send     [--text|--image|--auto]        reads stdin, sniffs, broadcasts
   recv     [--follow] [--latest-image --emit-path] [--out PATH]
   paste                                   write latest received item to OS clipboard
+  tui                                     launch the messenger-style chat TUI (SPEC §4)
   status   [--json]
   peers    [--json]
   config   set KEY VALUE | get KEY

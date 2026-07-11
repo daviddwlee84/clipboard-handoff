@@ -35,6 +35,8 @@ func (d *Daemon) handleConn(c net.Conn) {
 		d.handleRecv(c, req)
 	case ipc.OpPaste:
 		d.handlePaste(c)
+	case ipc.OpCopy:
+		d.handleCopy(c, req)
 	case ipc.OpSubscribe:
 		d.handleSubscribe(c, "any")
 	case ipc.OpStatus, ipc.OpPeers:
@@ -187,14 +189,45 @@ func (d *Daemon) handlePaste(c net.Conn) {
 	_ = ipc.WriteResp(c, okResp())
 }
 
+// handleCopy writes client-supplied bytes to the OS clipboard (TUI `y` on a
+// highlighted bubble). Unlike paste (which copies the daemon's latest buffered
+// item), the client hands over the exact payload — so any bubble, including the
+// user's own outgoing text, can be copied. Records the content hash for echo
+// suppression (SPEC §3 rule 2), same as writeClipboard.
+func (d *Daemon) handleCopy(c net.Conn, req *ipc.Request) {
+	if len(req.Bytes) == 0 {
+		_ = ipc.WriteResp(c, errResp(2, "empty payload"))
+		return
+	}
+	var err error
+	if req.Force == "image" {
+		err = clip.WritePNG(req.Bytes)
+	} else {
+		err = clip.WriteText(string(req.Bytes))
+	}
+	if err != nil {
+		_ = ipc.WriteResp(c, errResp(1, "clipboard: "+err.Error()))
+		return
+	}
+	d.mu.Lock()
+	d.lastCopy = wire.HashHex(req.Bytes)
+	d.mu.Unlock()
+	_ = ipc.WriteResp(c, okResp())
+}
+
 func (d *Daemon) handleStatus(c net.Conn) {
 	s := d.cfg.Get()
+	clipState := "unavailable"
+	if clip.Available() {
+		clipState = "available"
+	}
 	st := &ipc.Status{
 		Identity:   d.fp,
 		DeviceName: d.deviceName,
 		Room:       d.room,
 		Transport:  d.transportTag,
 		AutoCopy:   s.AutoCopy,
+		Clipboard:  clipState,
 		Peers:      d.tr.Peers(),
 		Buffer:     d.bufferLen(),
 	}

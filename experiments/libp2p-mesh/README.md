@@ -30,6 +30,7 @@ libp2p-mesh [--config-dir P --socket P --room NAME --json -q -v] <cmd>
   daemon [--foreground]      send [--text|--image|--auto]   recv [--follow] [--latest-image --emit-path] [--out P]
   paste                      status [--json]                peers [--json]
   config set/get KEY [VALUE] pair            # pair is a no-op: discovery is automatic (mDNS)
+  tui                        # messenger-style chat TUI (SPEC §4); keybindings in experiments/README.md
 ```
 
 ## Bake-off harness hook

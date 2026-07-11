@@ -46,6 +46,7 @@ const (
 	OpSend      = "send"
 	OpRecv      = "recv"
 	OpPaste     = "paste"
+	OpCopy      = "copy" // write arbitrary client-supplied bytes to the OS clipboard (TUI `y`)
 	OpSubscribe = "subscribe"
 	OpStatus    = "status"
 	OpPeers     = "peers"
@@ -67,6 +68,7 @@ type Status struct {
 	Room       string           `cbor:"room" json:"room"`
 	Transport  string           `cbor:"transport" json:"transport"`
 	AutoCopy   string           `cbor:"auto_copy" json:"auto_copy"`
+	Clipboard  string           `cbor:"clipboard,omitempty" json:"clipboard,omitempty"` // "available" | "unavailable" (SPEC §4 header)
 	Peers      []transport.Peer `cbor:"peers" json:"peers"`
 	Buffer     int              `cbor:"buffer" json:"buffer"`
 }

@@ -35,6 +35,8 @@ func (d *Daemon) handleConn(c net.Conn) {
 		d.handleRecv(c, req)
 	case ipc.OpPaste:
 		d.handlePaste(c)
+	case ipc.OpCopy:
+		d.handleCopy(c, req)
 	case ipc.OpSubscribe:
 		d.handleSubscribe(c, "any")
 	case ipc.OpStatus:
@@ -181,6 +183,41 @@ func (d *Daemon) handlePaste(c net.Conn) {
 	_ = ipc.WriteResp(c, okResp())
 }
 
+// handleCopy places a chosen item on the OS clipboard via the daemon (SPEC §4
+// TUI `y`), keeping the daemon the sole clipboard owner. Selection order:
+// an explicit MsgID (a received/buffered item) → inline Bytes (the TUI's own
+// outgoing text) → the latest buffered item.
+func (d *Daemon) handleCopy(c net.Conn, req *ipc.Request) {
+	if req.MsgID != "" {
+		item := d.findByID(req.MsgID)
+		if item == nil {
+			_ = ipc.WriteResp(c, errResp(5, "item not in buffer"))
+			return
+		}
+		if err := d.writeClipboard(item); err != nil {
+			_ = ipc.WriteResp(c, errResp(1, "clipboard: "+err.Error()))
+			return
+		}
+		_ = ipc.WriteResp(c, okResp())
+		return
+	}
+	if len(req.Bytes) > 0 {
+		// Inline text (the TUI copying one of its own sent messages). Record the
+		// content hash for echo suppression, exactly like a normal clipboard write.
+		hash := wire.HashHex(req.Bytes)
+		if err := clip.WriteText(string(req.Bytes)); err != nil {
+			_ = ipc.WriteResp(c, errResp(1, "clipboard: "+err.Error()))
+			return
+		}
+		d.mu.Lock()
+		d.lastCopy = hash
+		d.mu.Unlock()
+		_ = ipc.WriteResp(c, okResp())
+		return
+	}
+	d.handlePaste(c) // no selector: fall back to the latest item
+}
+
 func (d *Daemon) handleStatus(c net.Conn) {
 	s := d.cfg.Get()
 	st := &ipc.Status{
@@ -192,6 +229,7 @@ func (d *Daemon) handleStatus(c net.Conn) {
 		AutoCopy:    s.AutoCopy,
 		Peers:       0, // server does not push a peer list in Phase 0
 		Buffer:      d.bufferLen(),
+		Clipboard:   clip.Available(),
 	}
 	if st.Server == "" {
 		st.Server = s.Server
