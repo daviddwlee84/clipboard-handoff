@@ -1,46 +1,78 @@
 # cross-platform-copy
 
-A cross-platform **CLI/TUI for handing off clipboard content — text *and* images — between your own
-devices**, over one persistent connection. Copy or pipe something on one machine; it becomes instantly
-pasteable on another. Think AirDrop/Handoff, but for terminals, cross-platform, and scriptable.
+Hand off **text, images, and arbitrary files** between your own devices from the terminal — copy or pipe
+something on one machine and it's instantly usable on another. Think AirDrop/Handoff, but cross-platform,
+scriptable, and with a messenger TUI.
 
-This repo is a **technical bake-off**: several independent implementations of the same product contract,
-so we can compare which architecture is actually nicest to use.
+This repo is also a **technical bake-off**: several independent implementations of one shared contract, so we
+could compare which architecture is actually nicest to use. Three are now usable end-to-end.
 
-## The contenders
+## The implementations
 
 | Dir | Lang | Topology | The bet |
 |---|---|---|---|
-| [`mesh-rs/`](mesh-rs/) | Rust | P2P mesh, no server | Batteries-included P2P via **iroh** (NAT traversal, relay, blobs for free) |
-| [`room-go/`](room-go/) | Go | Central room server | **charmbracelet/wish** SSH room; zero-install text tier + native client for images; easy history |
-| [`experiments/`](experiments/) | Go | (various) | Small transport probes — `lan-go` (quic+mDNS), `libp2p-mesh` — to quantify iroh's value |
+| [`mesh-rs/`](mesh-rs/) (`clip`) | Rust | **True P2P mesh**, no server | **iroh** — NAT traversal, relays, blobs for free; mDNS LAN auto-discovery; E2E by default |
+| [`room-go/`](room-go/) (`room`) | Go | **Central room server** | **charmbracelet/wish** SSH room; SSH-key = identity; natural history; leanest binary |
+| [`experiments/lan-go/`](experiments/lan-go/) (`lan`) | Go | P2P mesh, no server | quic-go + mDNS, hand-rolled — the "is iroh's weight worth it?" probe |
+| [`experiments/libp2p-mesh/`](experiments/libp2p-mesh/) | Go | gossipsub mesh | **Parked** — 37 MB / ~140 deps for no gain here |
 
-All implementations obey one **shared contract**:
+All obey one contract: [`docs/SPEC.md`](docs/SPEC.md) (CLI, sinks, sessions), [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
+(wire envelope), [`docs/BAKEOFF.md`](docs/BAKEOFF.md) (scorecard + measurements).
 
-- [`docs/SPEC.md`](docs/SPEC.md) — CLI surface, UX flows, auto-copy semantics, OS support matrix
-- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the transport-agnostic wire envelope + image (PNG) rules
-- [`docs/BAKEOFF.md`](docs/BAKEOFF.md) — evaluation rubric + scorecard
+## What works (all three, verified)
+
+- **CLI hand-off** — pipe or pass a path; text / images / **arbitrary files**.
+- **Messenger TUI** — live chat, select a message, `y` copy · `s` save · `o` open. `mesh-rs` renders **inline
+  image thumbnails** (Kitty/iTerm2/Sixel, half-block fallback); the Go TUIs show metadata placeholders.
+- **Multi-device (N-peer)** — 3+ devices in a room at once; broadcast reaches all.
+- **Cross-machine over a real LAN**, including a **headless** Linux box (no display): the daemon degrades the
+  absent clipboard gracefully and delivery still works via `recv --emit-path` / sinks.
+- **Additive sinks** — received items can go to the clipboard **and/or** a folder (`save_dir`) **and/or** get
+  appended to a file (`text_file`).
+- **Session clearing** — `clear`, `daemon stop`, and TUI-quit can purge what a session received. Precisely
+  scoped: it never touches data that existed before the session.
+- **Notify-first by default** — received content is announced, not silently slammed into your clipboard.
+
+## Quick start
+
+Same CLI everywhere; only the binary name differs (`clip` / `room` / `lan`).
+
+```sh
+echo "hello" | clip send                 # pipe text
+clip send ./screenshot.png               # an image (auto-detected)
+clip send ./report.pdf                   # any file
+clip recv --follow                       # stream incoming text to stdout
+clip paste                               # put the latest received item on the clipboard
+clip tui                                 # messenger chat
+
+# route received items somewhere durable, in addition to the clipboard
+clip config set save_dir  ~/Downloads/handoff    # images + files land here
+clip config set text_file ~/handoff.md           # received text appends here
+clip config set auto_copy notify                 # notify|on|off  (default: notify)
+
+clip clear --all                         # clear what this session received (prompts)
+```
+
+Connecting devices: `mesh-rs`/`lan-go` **auto-discover** peers in the same `--room` on a LAN (mDNS; `clip pair`
+gives a ticket as a fallback). `room-go` clients `join room@host:port` on a server you run.
 
 ## The one cross-cutting truth
 
-> **Images can only auto-land on a device's OS clipboard via a native, resident agent on that device.**
+> **Images/files can only land on a device's OS clipboard via a native, resident agent on that device.**
 > Terminal escapes (OSC 52) carry **text only** (~74 KB, tmux-stripped). So every implementation runs a
 > per-device daemon that owns the clipboard; the only real difference between them is the **transport**.
 
-## Status
-
-Early. See `docs/` for the contract and [`.claude/plans/`](.claude/plans/) for the full plan. Phase 0 goal:
-two devices on a LAN, copy/pipe text or image on one → notify + one-key paste on the other.
-
-## Quick start (per impl)
+## Testing
 
 ```sh
-# same CLI surface everywhere; only the binary name differs (clip / room / lan / libp2p-mesh)
-echo "hello" | <bin> send                 # broadcast piped stdin
-<bin> send < testdata/small.png           # broadcast an image (auto-detected)
-<bin> recv --follow                       # print incoming text to stdout
-<bin> paste                               # write latest received item to the OS clipboard
-<bin> tui                                 # messenger-style chat window
+scripts/roundtrip.sh <impl>        # localhost: text + PNG round-trip, image compared by hash
+scripts/xmachine.sh  <impl>        # deploy to a remote LAN host and hand off for real (default: local_ubuntu)
+<impl>/scripts/e2e_sinks.sh        # files + folder/append sinks + clear semantics
+mesh-rs/scripts/autodiscover.sh    # two daemons connect with no ticket
 ```
 
-See each subdir's README for build/run instructions.
+## Status / not done
+
+LAN-first by design. **Not yet:** the internet/relay path (a config flag away for `mesh-rs`), Windows, Linux
+**desktop** clipboard validation (the test box is headless), and packaging/signing. See
+[`docs/BAKEOFF.md`](docs/BAKEOFF.md) for the measured comparison and [`.claude/plans/`](.claude/plans/) for the plan.
