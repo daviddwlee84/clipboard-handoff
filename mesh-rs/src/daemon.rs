@@ -58,6 +58,10 @@ pub struct Daemon {
     dialing: Mutex<HashSet<EndpointId>>,
     allowlist: Mutex<HashSet<EndpointId>>,
     ring: Mutex<VecDeque<Item>>,
+    /// Items this daemon *originated* (locally sent), keyed most-recent-last. Kept separate from
+    /// `ring` (which is received-only, so `recv`/roundtrip semantics are untouched) purely so the
+    /// TUI can `PasteItem` its own bubbles back to the clipboard.
+    sent: Mutex<VecDeque<Item>>,
     /// Content-addressed PNG store (locally-sent + received), keyed by BLAKE3 hex.
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     dedup: Mutex<Dedup>,
@@ -147,6 +151,7 @@ pub async fn run(paths: Paths) -> Result<()> {
         dialing: Mutex::new(HashSet::new()),
         allowlist: Mutex::new(HashSet::new()),
         ring: Mutex::new(VecDeque::new()),
+        sent: Mutex::new(VecDeque::new()),
         blobs: Mutex::new(HashMap::new()),
         dedup: Mutex::new(Dedup::new(4096)),
         events,
@@ -387,7 +392,8 @@ impl Daemon {
                         let mut env = self.base_envelope(MsgType::Text, "text/plain; charset=utf-8");
                         env.text = Some(text);
                         let n = self.broadcast(&env).await;
-                        Resp::Ok(OkData::Text(n.to_string()))
+                        self.record_sent(&env, None);
+                        Resp::Ok(OkData::Sent { msg_id: env.msg_id, reached: n })
                     }
                     Ok(Sniffed::Image { png, w, h }) => {
                         let hash = blake3_hex(&png);
@@ -400,7 +406,8 @@ impl Daemon {
                             h,
                         });
                         let n = self.broadcast(&env).await;
-                        Resp::Ok(OkData::Text(n.to_string()))
+                        self.record_sent(&env, None);
+                        Resp::Ok(OkData::Sent { msg_id: env.msg_id, reached: n })
                     }
                     Err(e) => Resp::Err {
                         code: 2,
@@ -477,6 +484,29 @@ impl Daemon {
                         Err(e) => Resp::Err {
                             code: 5,
                             message: e.to_string(),
+                        },
+                    }
+                };
+                write_frame(&mut stream, &resp).await?;
+            }
+            Req::PasteItem { msg_id } => {
+                let resp = if !self.clipboard_available {
+                    Resp::Err {
+                        code: 1,
+                        message: "clipboard unavailable (headless) — cannot copy".into(),
+                    }
+                } else {
+                    match self.find_item(&msg_id) {
+                        Some(item) => match self
+                            .write_to_clipboard(&item.envelope, item.local_path.as_deref())
+                            .await
+                        {
+                            Ok(()) => Resp::Ok(OkData::Text(describe(&item.envelope))),
+                            Err(e) => Resp::Err { code: 1, message: e.to_string() },
+                        },
+                        None => Resp::Err {
+                            code: 5,
+                            message: "item no longer buffered".into(),
                         },
                     }
                 };
@@ -575,6 +605,36 @@ impl Daemon {
     fn latest(&self, kind: RecvKind) -> Option<Item> {
         let ring = self.ring.lock().unwrap();
         ring.iter().rev().find(|it| kind_matches(kind, &it.envelope)).cloned()
+    }
+
+    /// Remember a locally-sent item (for the TUI's `PasteItem`). Capped like the recv ring.
+    fn record_sent(&self, env: &Envelope, local_path: Option<String>) {
+        let mut sent = self.sent.lock().unwrap();
+        sent.push_back(Item { envelope: env.clone(), local_path });
+        while sent.len() > RING_CAP {
+            sent.pop_front();
+        }
+    }
+
+    /// Find a buffered item by ULID — searches received items first, then locally-sent ones.
+    fn find_item(&self, msg_id: &str) -> Option<Item> {
+        if let Some(it) = self
+            .ring
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|it| it.envelope.msg_id == msg_id)
+        {
+            return Some(it.clone());
+        }
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|it| it.envelope.msg_id == msg_id)
+            .cloned()
     }
 
     async fn paste_latest(&self) -> Result<String> {

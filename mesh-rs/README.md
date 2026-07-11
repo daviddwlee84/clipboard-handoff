@@ -125,6 +125,7 @@ real display-less host.
 | `clip send [--text\|--image\|--auto]` | Read stdin to EOF, sniff type (PROTOCOL §2), broadcast. |
 | `clip recv [--follow] [--latest-image --emit-path] [--out PATH]` | Text→stdout; image→temp file, print path. `--follow` streams; otherwise returns the latest buffered item. |
 | `clip paste` | Write the latest received item to the OS clipboard (text→set_text, image→PNG→RGBA→set_image). |
+| `clip tui` | Messenger-style chat TUI attached to the daemon (see below). |
 | `clip pair --new [--json]` / `clip pair <ticket>` | Create / join a pairing. |
 | `clip peers` / `clip status [--json]` | Inspect peers / daemon state (`status` includes `clipboard: available\|unavailable`). |
 | `clip config set KEY VALUE` / `clip config get KEY` | Persist settings (SPEC §5). |
@@ -140,6 +141,51 @@ real display-less host.
 
 Echo/loop suppression (SPEC §3): dedupe by `msg_id`; the daemon records the hash of what it last
 wrote to its own clipboard; received items are never re-broadcast.
+
+## Messenger TUI (`clip tui`)
+
+A messenger-style chat bound to the local daemon (SPEC §4). It is a thin **front-end**: it never
+opens the OS clipboard itself (that would make it a second clipboard owner) — every copy is routed
+through the daemon, which owns the clipboard. Like every other subcommand it **auto-spawns** the
+daemon if it isn't running, then `Subscribe`s to the daemon's event stream for live items.
+
+```sh
+clip --room demo tui           # auto-spawns the daemon, attaches, and opens the chat
+```
+
+Layout: a **header** (room · short endpoint id · peer count · `auto_copy` mode ·
+`clipboard: available|unavailable`), a scrollable **message history** in the middle (your own
+bubbles are right-aligned and labelled `you`; peers are left-aligned and colour-coded), and a
+**composer** (tui-textarea) at the bottom with a one-line keybinding hint.
+
+Keybindings:
+
+| Key | Action |
+|---|---|
+| type + `Enter` | Send the line as a text item; it appears immediately as your own bubble. |
+| `Esc` | Toggle focus between the **composer** and **browse** mode. |
+| `↑` / `↓` (or `k` / `j` in browse) | Move the highlight over messages. |
+| `y` | Copy the highlighted (or latest) item to the OS clipboard **via the daemon**. |
+| `s` | Save the highlighted image to a file (`~/Downloads/clip-<hash>.png`, else the cwd). |
+| `o` | Open the highlighted image with the OS default app (`open`/`xdg-open`/`start`). |
+| `q` (browse) · `Ctrl-C` (any) | Quit, restoring the terminal. |
+
+**Notify-first (respects `auto_copy`):** in the default `notify` mode the TUI does **not** touch the
+clipboard on receipt — incoming items surface with a subtle `● press y to copy` affordance and a
+toast; you press `y` to place the highlighted one. In `on` mode the daemon has already copied it
+(the TUI just says so); in `off` mode items are only shown.
+
+**Images:** every image bubble always shows metadata (`🖼 W×H · size · filename`). A thumbnail is
+rendered inline with ratatui-image's `StatefulProtocol` — a real terminal graphics protocol
+(**Kitty / iTerm2 / Sixel**) when one is detected at startup, otherwise **Unicode half-blocks**; if
+the file can't be decoded or the thumbnail isn't ready yet, the metadata line stands in as the text
+placeholder. Image **decode and resize/encode run off the UI thread** (a `spawn_blocking` decode
+plus a resize worker task), so the event loop never blocks on image work. First launch on a terminal
+that doesn't answer the graphics-capability query pauses ~1–2 s while that probe times out; terminals
+that do answer (most modern ones) start instantly.
+
+Stack: **ratatui 0.29 + ratatui-image 9 + tui-textarea 0.7 + crossterm 0.28**, on the existing tokio
+runtime (pinned as one consistent set; tui-textarea caps ratatui at 0.29).
 
 ## Manual smoke test (macOS)
 
@@ -167,6 +213,9 @@ clip --config-dir /tmp/b --socket /tmp/b.sock --room demo paste    # -> pbpaste 
   headless host it's detected once at startup and all writes degrade to clear no-ops (see the
   headless section above). Linux X11 clipboard persistence (owner-must-stay-alive) and
   `wayland-data-control` are Phase 1/3.
-- **TUI** (ratatui) is Phase 2 — not built.
+- **TUI** (ratatui) — **built** (Phase 2): `clip tui`, a messenger-style chat over the daemon's
+  event stream with inline image thumbnails (Kitty/iTerm2/Sixel → Unicode half-blocks). See the
+  [Messenger TUI](#messenger-tui-clip-tui) section above. Pasting an image *into* the composer is
+  not wired yet (send images with `clip send --image`).
 - **Trust**: Phase 0 auto-allowlists any peer you pair/connect with. TOFU-with-approval (holding
   first contact pending) is Phase 1.

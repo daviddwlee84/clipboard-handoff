@@ -36,3 +36,14 @@ tokio-stream = "0.1.17"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ulid = "1.2.1"
+# ---- TUI (`clip tui`) --------------------------------------------------------
+# Pinned as a consistent set: tui-textarea 0.7 caps ratatui at ^0.29, so the whole
+# widget stack rides ratatui 0.29 + its crossterm 0.28 (event-stream = async input).
+# ratatui-image 9.0.0 is the release that targets ratatui 0.29 and renders the inline
+# image thumbnails (Kitty/iTerm2/Sixel graphics, degrading to Unicode half-blocks).
+ratatui = "0.29"
+# default-features off => drop the optional libchafa dynamic link; the Unicode half-block
+# fallback (built in) is exactly the degradation path we want when no graphics protocol exists.
+ratatui-image = { version = "=9.0.0", default-features = false, features = ["crossterm", "image-defaults"] }
+tui-textarea = "0.7.0"
+crossterm = { version = "0.28", features = ["event-stream"] }

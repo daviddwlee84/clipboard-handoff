@@ -86,6 +86,9 @@ pub enum Req {
     Send { kind: SniffKind, bytes: ByteBuf },
     RecvLatest { kind: RecvKind },
     Paste,
+    /// Copy a *specific* buffered item (by ULID) to the OS clipboard. Used by the TUI's `y`
+    /// key so the highlighted bubble — not just the latest — can be placed on the clipboard.
+    PasteItem { msg_id: String },
     Subscribe,
     Peers,
     Status,
@@ -105,6 +108,9 @@ pub enum Resp {
 pub enum OkData {
     None,
     Text(String),
+    /// Result of a `Send`: the ULID assigned to the broadcast item + how many peers it reached.
+    /// The TUI uses `msg_id` to key its own outgoing bubble (so `y` can copy it back later).
+    Sent { msg_id: String, reached: usize },
     Item {
         envelope: Envelope,
         local_path: Option<String>,

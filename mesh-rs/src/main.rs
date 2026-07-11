@@ -5,6 +5,7 @@ mod clipboard;
 mod config;
 mod daemon;
 mod proto;
+mod tui;
 
 use std::path::PathBuf;
 
@@ -68,6 +69,8 @@ enum Cmd {
     },
     /// Write the latest received item to the OS clipboard.
     Paste,
+    /// Launch the messenger-style chat TUI (SPEC §4).
+    Tui,
     /// Create a pairing ticket (--new) or join with a <ticket>.
     Pair {
         #[arg(long)]
@@ -131,6 +134,7 @@ async fn dispatch(cli: Cli, paths: config::Paths) -> Result<i32> {
             out,
         } => client::cmd_recv(&paths, follow, latest_image, emit_path, out).await,
         Cmd::Paste => client::cmd_paste(&paths).await,
+        Cmd::Tui => tui::run(&paths).await,
         Cmd::Pair { new, ticket } => client::cmd_pair(&paths, new, ticket, json).await,
         Cmd::Peers => client::cmd_peers(&paths, json).await,
         Cmd::Status => client::cmd_status(&paths, json).await,

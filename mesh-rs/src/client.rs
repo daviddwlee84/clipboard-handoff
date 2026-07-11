@@ -24,7 +24,7 @@ async fn connect(paths: &Paths) -> Result<IpcStream> {
 }
 
 /// Connect to the daemon, spawning it (detached) if it isn't running yet.
-async fn connect_or_spawn(paths: &Paths) -> Result<IpcStream> {
+pub(crate) async fn connect_or_spawn(paths: &Paths) -> Result<IpcStream> {
     if let Ok(s) = connect(paths).await {
         return Ok(s);
     }
@@ -56,7 +56,7 @@ fn spawn_daemon(paths: &Paths) -> Result<()> {
 }
 
 /// One-shot request/response.
-async fn request(paths: &Paths, req: Req) -> Result<Resp> {
+pub(crate) async fn request(paths: &Paths, req: Req) -> Result<Resp> {
     let mut s = connect_or_spawn(paths).await?;
     write_frame(&mut s, &req).await?;
     read_frame(&mut s).await
@@ -85,9 +85,15 @@ pub async fn cmd_send(paths: &Paths, text: bool, image: bool, _auto: bool) -> Re
         }
     };
     match resp {
+        Resp::Ok(OkData::Sent { reached, .. }) => {
+            if reached == 0 {
+                // no peers: warning, not a failure — item is still accepted/buffered.
+                eprintln!("clip send: warning: no peers connected");
+            }
+            Ok(0)
+        }
         Resp::Ok(OkData::Text(reached)) => {
             if reached == "0" {
-                // no peers: warning, not a failure — item is still accepted/buffered.
                 eprintln!("clip send: warning: no peers connected");
             }
             Ok(0)
