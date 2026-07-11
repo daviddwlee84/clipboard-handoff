@@ -25,6 +25,23 @@ Both Go mesh probes independently had to hand-solve two things — **dedup diali
 dial at once; "smaller id dials" rule) and **discovery retry** (mDNS stops re-querying after first hit) — that
 **iroh hides for free**. That is the single most decision-relevant finding of the bake-off.
 
+## Cross-machine — mac ↔ headless Ubuntu 24.04, real LAN (`scripts/xmachine.sh`)
+
+The three 1.0 targets were deployed to a **display-less** Ubuntu box (Go: `CGO_ENABLED=0` cross-compile + scp;
+Rust: rsync + `cargo build` on the box) and driven through a real cross-machine hand-off (this Mac → Ubuntu),
+verifying the PNG by hash. All pass; the headless daemons run fine and degrade the (absent) clipboard gracefully.
+
+| | connectivity across machines | text | image (hash-equal) | headless |
+|---|---|---|---|---|
+| `mesh-rs` | iroh mDNS auto-discovery (ticket fallback) | ✅ | ✅ | ✅ clipboard degrades cleanly |
+| `room-go` | client dials server LAN IP | ✅ | ✅ | ✅ (server needs no display) |
+| `lan-go` | mDNS auto-discovery | ✅ | ✅ | ✅ |
+
+Caveat: `mesh-rs` mDNS auto-discovery is timing-sensitive on a multi-interface host (Tailscale + LAN); the ticket
+fallback (direct QUIC over the LAN address) is reliable. `room-go` required a real fix — it generated its SSH host
+key in a way that chmod-ed `/tmp` (EPERM on a server); now fixed.
+
+
 ## Scorecard
 
 Scores 1 (poor) – 5 (excellent), grounded in the Phase 0 evidence above. Rows tagged **[built]** are exercised by
