@@ -11,7 +11,14 @@
 package server
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"errors"
+	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/charmbracelet/log"
 	"github.com/charmbracelet/ssh"
@@ -37,14 +44,50 @@ type Config struct {
 
 // New builds the wish SSH server.
 func New(cfg Config, b *broker.Broker) (*ssh.Server, error) {
+	pemBytes, err := hostKeyPEM(cfg.HostKey)
+	if err != nil {
+		return nil, fmt.Errorf("host key: %w", err)
+	}
 	return wish.NewServer(
 		wish.WithAddress(cfg.Addr),
-		wish.WithHostKeyPath(cfg.HostKey), // auto-generates an ed25519 host key if missing
+		wish.WithHostKeyPEM(pemBytes), // load/generate ourselves; avoids keygen chmod of a shared dir like /tmp
 		wish.WithPublicKeyAuth(publicKeyAuth(cfg.AuthorizedKeys)),
 		wish.WithMiddleware(
 			relayMiddleware(b),
 		),
 	)
+}
+
+// hostKeyPEM loads the OpenSSH host key at path, generating a fresh ed25519 key
+// (written 0600) if it is missing. It creates any missing parent directories but
+// never chmods a pre-existing one — so a key path under a shared dir such as
+// /tmp works for an unprivileged user. (wish.WithHostKeyPath delegates to
+// charmbracelet/keygen, which chmods the key's parent dir and thus fails with
+// EPERM on /tmp.)
+func hostKeyPEM(path string) ([]byte, error) {
+	if b, err := os.ReadFile(path); err == nil {
+		return b, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, err
+		}
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	block, err := gossh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		return nil, err
+	}
+	pemBytes := pem.EncodeToMemory(block)
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		return nil, err
+	}
+	return pemBytes, nil
 }
 
 // publicKeyAuth authorizes a connecting device by its SSH public key and
