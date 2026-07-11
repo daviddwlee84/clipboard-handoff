@@ -1,0 +1,159 @@
+# room-go — Phase 0 (the central-room / SSH bet)
+
+`room-go` is one of the two headliners in the cross-platform clipboard hand-off
+bake-off. It implements the shared contract in [`../docs/SPEC.md`](../docs/SPEC.md)
+and [`../docs/PROTOCOL.md`](../docs/PROTOCOL.md), using a **central room server
+spoken over SSH** (charmbracelet/wish + charmbracelet/ssh, public-key auth) with
+**native client daemons** that own each device's OS clipboard.
+
+Binary: **`room`**. Module: `github.com/daviddwlee84/cross-platform-copy/room-go`.
+Go 1.26, cgo required for the clipboard backend.
+
+## What Phase 0 delivers
+
+- **Real SSH/wish server** (`room server`) — not a TCP fallback. A device is
+  authorized by its SSH public key (PROTOCOL §3: the key fingerprint *is* the
+  identity). Each connection joins a room (the SSH exec command = the room name)
+  and the server relays every framed CBOR envelope to the room's other members
+  via an in-memory broker fan-out adapted from the user's `sshbbs`
+  `internal/chat/broker.go` (same map-of-sessions shape, same self-send guard —
+  the originator never receives its own message).
+- **Native client daemon** (`room daemon`) — holds the persistent SSH
+  connection, owns the OS clipboard (golang.design/x/clipboard, PNG-native),
+  keeps a ring buffer of received items, and serves thin clients over a local
+  Unix-socket IPC (PROTOCOL §4: length-prefixed CBOR, `Subscribe` event stream).
+  Auto-spawned by the first client command.
+- **Thin clients**: `send` · `recv` · `paste` · `status` · `config` · `join`.
+- **Auto-copy** default `notify` (received items are surfaced but the clipboard
+  is *not* written until `paste`); `on` writes immediately; `off` never touches
+  it. Echo/loop suppression: dedupe by `msg_id`, remember the last content-hash
+  we wrote, and never re-broadcast a received item.
+- **Images are PNG on the wire** with a **BLAKE3** integrity hash verified on
+  receipt. Text rides inline.
+
+### Phase 0 simplifications (documented, per the task brief)
+
+- **Image bytes ride inline** in the envelope (`blob_data`) and are relayed
+  through the server. PNG is still the canonical wire format and the BLAKE3 hash
+  is still verified. The PROTOCOL §1 "announce + pull by hash" optimization is
+  Phase 1.
+- **Server trusts any key by default** (`--authorized-keys` restricts it). The
+  SSH-key-as-identity model is fully in place — every client presents a key and
+  its fingerprint is captured — but Phase 0 skips the manual allowlist step so
+  the automated harness runs without an out-of-band key exchange. Restrict with
+  `room server --authorized-keys FILE`.
+- **Host key is trusted on connect** (`InsecureIgnoreHostKey`) — fine for
+  loopback/LAN Phase 0; host-key pinning is Phase 1.
+- **Daemon allowlist/TOFU** for *senders* is trust-all in Phase 0 (allowlist +
+  approval prompt is Phase 1). `auto_copy` mode still governs the clipboard.
+- The **bare `ssh room@server` bubbletea TUI tier + OSC 52** is Phase 1–2, not
+  built here. Phase 0 is the native-client hand-off only.
+
+## Build
+
+```sh
+cd room-go
+go build -o bin/room ./cmd/room     # same command the harness uses
+go test ./...                        # unit tests (add -race to stress the broker)
+go vet ./...
+```
+
+## Run — the exact Phase 0 flow
+
+Three moving parts: one server, two native daemons (each with its own
+`--config-dir`/`--socket`), both joined to the same room.
+
+```sh
+BIN=./bin/room
+PORT=2299
+A=(--config-dir /tmp/a --socket /tmp/a.sock --room demo)
+B=(--config-dir /tmp/b --socket /tmp/b.sock --room demo)
+
+# 1) start the SSH room server (host key auto-generated if missing)
+$BIN server --addr :$PORT --host-key /tmp/host_key &
+
+# 2) configure + connect each device. `join` generates the client's SSH key on
+#    first use, prints its fingerprint (to allowlist server-side if you enable
+#    --authorized-keys), auto-spawns the daemon, and connects it to the room.
+$BIN "${A[@]}" join room@localhost:$PORT
+$BIN "${B[@]}" join room@localhost:$PORT
+
+# 3) text hand-off: A -> B
+printf 'hi' | $BIN "${A[@]}" send --text
+$BIN "${B[@]}" recv                       # prints: hi
+
+# 4) image hand-off: A -> B, hash-equal
+$BIN "${A[@]}" send --image < ../testdata/small.png
+$BIN "${B[@]}" recv --latest-image --emit-path   # prints a PNG path; hash == source
+$BIN "${B[@]}" paste                      # (auto_copy notify) put it on the clipboard
+```
+
+`join` auto-spawns the daemon, so the explicit `daemon` step is optional. To run
+a daemon in the foreground for debugging (and set the server in one shot):
+
+```sh
+$BIN "${A[@]}" daemon --foreground --server room@localhost:$PORT
+```
+
+### Command surface (SPEC §2)
+
+| Command | Notes |
+|---|---|
+| `room server [--addr :2222] [--host-key PATH] [--authorized-keys FILE]` | run the SSH room server |
+| `room daemon [--foreground] [--server user@host:port]` | run the client daemon (usually auto-spawned) |
+| `room join <user@host:port>` | generate/print the client key fingerprint, connect the daemon to a server+room |
+| `room send [--text\|--image\|--auto]` | read stdin, sniff type, broadcast |
+| `room recv [--follow] [--latest-image --emit-path] [--out PATH]` | text→stdout, image→file path |
+| `room paste` | write the latest received item to the OS clipboard |
+| `room status [--json]` | identity / room / server / connected / auto_copy / buffer |
+| `room config set KEY VALUE` · `room config get KEY` | `auto_copy`, `device_name`, `room`, `server`, … (SPEC §5) |
+
+Global flags (before the subcommand): `--config-dir PATH`, `--socket PATH`,
+`--room NAME`, `--json`, `-q/--quiet`, `-v/--verbose`. Exit codes follow SPEC §2
+(`0` ok · `2` usage · `3` no daemon · `4` no peers/not connected — a send
+warning · `5` nothing to paste/recv).
+
+## Wiring the bake-off harness (`scripts/roundtrip.sh`)
+
+The harness already knows how to build/run `room-go` (`bin/room`, `go build -o
+bin/room ./cmd/room`). Its `start_pair()` has a `room-go` branch left as a TODO.
+**Do not edit the harness for me** — the room-go hook is simply: after the two
+`daemon --foreground` processes are up, join both to a server. Concretely, the
+`room-go)` case in `start_pair()` should become:
+
+```sh
+room-go)
+  # start the server once (reuse $ROOM as the room name)
+  "$BIN" server --addr :2299 --host-key "$RUN/host_key" >"$RUN/server.log" 2>&1 & PIDS+=($!)
+  sleep 1
+  "$BIN" "${A[@]}" join room@localhost:2299 >/dev/null
+  "$BIN" "${B[@]}" join room@localhost:2299 >/dev/null
+  ;;
+```
+
+Everything else in the harness (the `send --text` / `recv --follow` text check
+and the `send --image` / `recv --latest-image --emit-path` hash check) works
+against `room` unchanged. The harness sets `config set auto_copy off` for a
+deterministic buffer; `room` honors it.
+
+## Layout
+
+```
+cmd/room/            CLI: global-flag parsing + subcommand dispatch
+internal/wire/       Envelope, CBOR codec, length-prefixed framing, type-sniff, BLAKE3   (+ tests)
+internal/broker/     server-side per-room fan-out (adapted from sshbbs broker)           (+ tests)
+internal/server/     charmbracelet/wish SSH server + pubkey auth + relay handler
+internal/daemon/     resident agent: SSH conn, ring buffer, IPC, auto-copy, dedupe       (+ tests)
+internal/ipc/        client<->daemon request/response types, framing, dial + auto-spawn
+internal/config/     config dir, config.json (SPEC §5), SSH identity key
+internal/clip/       golang.design/x/clipboard wrapper (lazy init; text + PNG)
+```
+
+## Tests
+
+- `internal/wire`: envelope CBOR round-trip (text + image, incl. inline blob),
+  type-sniff (PNG/JPEG/UTF-8/invalid), PNG passthrough preserves bytes, JPEG→PNG
+  transcode, frame round-trip.
+- `internal/broker`: fan-out excludes the sender, room isolation, unregister
+  cleanup, and a `-race` concurrency stress.
+- `internal/daemon`: `msg_id` dedupe / echo-suppression + bounded eviction.

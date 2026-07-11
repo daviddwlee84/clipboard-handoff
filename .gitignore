@@ -1,0 +1,31 @@
+# ---- Rust ----
+target/
+**/target/
+*.rs.bk
+Cargo.lock.orig
+
+# ---- Go ----
+*.exe
+*.exe~
+*.test
+*.out
+/room-go/bin/
+/experiments/**/bin/
+vendor/
+
+# ---- app runtime state ----
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+hostkey
+hostkey.pub
+*.sock
+/scripts/.run/
+
+# ---- OS / editor ----
+.DS_Store
+*.swp
+.idea/
+.vscode/
+.specstory/

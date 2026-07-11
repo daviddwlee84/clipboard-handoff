@@ -1,0 +1,3 @@
+# Built probe binaries (produced by `go build -o bin/...`); harness rebuilds them.
+lan-go/bin/
+libp2p-mesh/bin/

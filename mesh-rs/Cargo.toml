@@ -1,0 +1,31 @@
+[package]
+name = "mesh-rs"
+version = "0.1.0"
+edition = "2024"
+description = "mesh-rs Phase 0 — P2P clipboard hand-off over iroh (binary: clip)"
+
+[[bin]]
+name = "clip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.103"
+arboard = { version = "3.6.1", features = ["image-data"] }
+blake3 = "1.8.5"
+ciborium = "0.2.2"
+clap = { version = "4.6.1", features = ["derive"] }
+data-encoding = "2.11.0"
+directories = "6.0.0"
+hex = "0.4.3"
+image = "0.25.10"
+interprocess = { version = "2.4.2", features = ["tokio"] }
+# iroh's API churns across releases; pin it EXACTLY. This code targets the iroh 1.0.2 API
+# (EndpointId/EndpointAddr, presets::Minimal, Router/ProtocolHandler, conn.open_bi/accept_bi).
+iroh = "=1.0.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_bytes = "0.11.19"
+serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ulid = "1.2.1"

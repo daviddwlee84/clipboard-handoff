@@ -1,0 +1,11 @@
+// go.work ties the experiments-track probes to the local shared-go helper so
+// `lan-go` and `libp2p-mesh` build against ../shared-go without a published
+// version. Each probe's go.mod also carries a `replace` for the same purpose,
+// so builds work with GOWORK=off too.
+go 1.26.4
+
+use (
+	./shared-go
+	./lan-go
+	./libp2p-mesh
+)
