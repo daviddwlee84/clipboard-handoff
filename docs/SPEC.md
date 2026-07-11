@@ -22,15 +22,16 @@ Binary names: `mesh-rs` → `clip`, `room-go` → `room`, `experiments/lan-go` �
 
 | Command | Behavior |
 |---|---|
-| `BIN send [--text\|--image\|--auto]` | Read **stdin** to EOF, sniff type (default `--auto`: valid UTF-8 → text; PNG/JPEG magic bytes → image), broadcast to all connected peers. Exits 0 after the daemon has accepted it. |
-| `BIN recv [--follow] [--latest-image --emit-path] [--out PATH]` | Subscribe to incoming items. Text → stdout. Image → write to a temp file and print its path (`--emit-path`) or to `--out`. `--follow` streams until Ctrl-C; without it, waits for the next single item (or returns the latest buffered one). |
-| `BIN paste` | Write the **latest received item** into the local OS clipboard (text via set_text, image via set_image). This is the "one-key paste" for the default notify-first mode. |
+| `BIN send [PATH] [--text\|--image\|--file\|--auto] [--name NAME]` | Send `PATH` (or **stdin** to EOF), sniff type (default `--auto`: PNG/JPEG magic → image; `--file`/binary → file; valid UTF-8 → text), broadcast to all connected peers. A file/image carries its `filename` (from `PATH`/`--name`). Exits 0 after the daemon has accepted it. |
+| `BIN recv [--follow] [--latest-image --emit-path] [--out PATH]` | Subscribe to incoming items. Text → stdout. Image/file → write to a temp file and print its path (`--emit-path`) or to `--out`. `--follow` streams until Ctrl-C; without it, waits for the next single item (or returns the latest buffered one). |
+| `BIN paste` | Write the **latest received item** into the local OS clipboard (text via set_text, image via set_image; a `file` has no clipboard form — its path is copied as text). This is the "one-key paste" for the default notify-first mode. |
+| `BIN clear [--all] [--yes]` | Clear this session's received data (see §8). Default: **transient** only (fetched-blob cache, emit-path temp files, in-memory buffer). `--all` also reverts session sink writes (truncate `text_file` to session-start, delete files this session wrote to `save_dir`) — prompts unless `--yes`. |
 | `BIN tui` | Launch the messenger-style chat TUI (see §4). |
 | `BIN pair` / `BIN join` | Establish membership. **mesh** (`clip`,`lan`,`libp2p-mesh`): `pair --new` prints a ticket + QR; peer runs `pair <ticket>`; short-code confirm. **room** (`room`): `join <user@server>` using an SSH key. |
 | `BIN peers` | List currently-connected peers (name, id/fingerprint, direct/relayed, last-seen). |
 | `BIN status` | Show daemon state: identity, transport mode (lan/internet), auto_copy setting, peer count, buffer size. |
 | `BIN config set KEY VALUE` / `BIN config get KEY` | Persist settings (see §5). |
-| `BIN daemon [--foreground]` | Run the resident daemon. Normally auto-spawned; `--foreground` for debugging. |
+| `BIN daemon [--foreground]` · `BIN daemon stop` | Run the resident daemon (normally auto-spawned; `--foreground` for debugging). `daemon stop` shuts it down, applying `clear_on_exit` (§8). |
 
 **Exit codes:** `0` success · `1` generic error · `2` usage error · `3` no daemon / cannot reach daemon ·
 `4` reserved · `5` nothing to paste/recv. **`send` with no connected peers exits `0`** with a stderr warning
@@ -39,9 +40,20 @@ Binary names: `mesh-rs` → `clip`, `room-go` → `room`, `experiments/lan-go` �
 **Global flags:** `--room NAME` (default `default`), `--config-dir PATH`, `--socket PATH`, `-q/--quiet`, `-v/--verbose`,
 `--json` (machine-readable output for `peers`/`status`).
 
-## 3. Auto-copy semantics (identical; default = `notify`)
+## 3. Sinks & auto-copy — where received items go (identical)
 
-`config set auto_copy notify|on|off`:
+A received item can fan out to any combination of **sinks**, chosen by type:
+
+- **clipboard** (text, image) — governed by `auto_copy` (below). A `file` has no image clipboard form.
+- **folder** (`save_dir`) — if set, received **image/file** items are written there using their `filename`
+  (de-duplicated: `name (2).ext` on collision). This is a file's primary landing place.
+- **append-file** (`text_file`) — if set, received **text** items are appended, each preceded by a
+  `\n---\n<device> <ISO-ts>\n` header.
+
+Sinks are additive (an item can hit clipboard AND folder/file). All routing is subject to the allowlist and the
+echo/loop suppression below, and everything written this session is tracked for `clear` (§8).
+
+**Clipboard — `config set auto_copy notify|on|off`:**
 
 - **`notify`** (default, safest): on receiving an item from an **allowlisted** peer, show a desktop notification
   and a TUI toast, but do **NOT** write the OS clipboard. The user presses one key in the TUI, or runs `BIN paste`,
@@ -73,7 +85,10 @@ held pending explicit approval (TOFU). See PROTOCOL §identity.
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `auto_copy` | `notify` \| `on` \| `off` | `notify` | §3 |
+| `auto_copy` | `notify` \| `on` \| `off` | `notify` | §3 clipboard sink |
+| `save_dir` | path \| "" | "" | Folder sink: received image/file items written here (§3) |
+| `text_file` | path \| "" | "" | Append sink: received text appended here (§3) |
+| `clear_on_exit` | `ask` \| `transient` \| `all` \| `never` | `ask` | §8 — what a session-end does |
 | `internet` | `on` \| `off` | `off` | LAN-only vs enable relay/hole-punch/global discovery (Phase 3) |
 | `device_name` | string | hostname | Shown to peers |
 | `room` | string | `default` | Default room/topic |
@@ -99,3 +114,27 @@ On one LAN, two devices in the same room, `auto_copy on` for the test:
    **BLAKE3 hash equals** the source; with `auto_copy on`, the image is on B's clipboard.
 
 The bake-off harness (`scripts/`) automates (1) and (2) for every impl.
+
+## 8. Sessions & clearing (privacy)
+
+Hand-off leaves data behind (fetched blobs, temp files, clipboard-cached content, and — if configured — files in
+`save_dir` and lines in `text_file`). A **session** can clear that on exit.
+
+**What "session end" means (both trigger a clear decision):**
+- **TUI quit** (`q`/`Ctrl-C` in `BIN tui`) → an interactive prompt: *clear this session? [t]ransient / [a]ll incl sinks / [n]o*.
+- **`BIN daemon stop`** (or the daemon receiving SIGTERM) → applies the `clear_on_exit` policy non-interactively.
+
+**Two scopes:**
+- **transient** (always safe to clear): the fetched-blob cache, `recv --emit-path` temp files, and the in-memory
+  received-items buffer.
+- **sinks** (session-scoped, needs confirmation): truncate `text_file` back to its **session-start offset** (so only
+  text appended *this session* is removed) and delete the files this session wrote into `save_dir`. Never touches
+  content from before the session, and never deletes a whole user directory.
+
+**`clear_on_exit` policy** (for `daemon stop` / SIGTERM): `never` (keep everything) · `transient` (purge transient
+only) · `all` (transient + session sink writes) · `ask` (prompt if a TTY is attached, else fall back to `transient`).
+
+**Manual:** `BIN clear` (transient) / `BIN clear --all` (transient + session sinks, prompts unless `--yes`) any time.
+
+The daemon records, per session: the transient store location, the `text_file` size at session start, and the list
+of `save_dir` files it wrote — so a clear is precise and reversible-in-scope, never destructive beyond the session.

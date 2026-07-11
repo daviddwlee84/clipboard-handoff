@@ -14,30 +14,33 @@ the fields match):
 Envelope {
   v:          u16          // protocol version, currently 1
   msg_id:     string       // ULID (lexicographically sortable, time-based) — the dedupe key
-  type:       "text" | "image"
-  mime:       string       // "text/plain; charset=utf-8" | "image/png"
+  type:       "text" | "image" | "file"
+  mime:       string       // text/plain; charset=utf-8 | image/png | best-effort for files (application/octet-stream)
   sender:     string       // stable peer identity (see §3): Ed25519 node id / TLS cert fp / ssh key fp
   device_name:string       // human label, advisory only
   ts:         u64          // unix milliseconds at the sender
+  filename?:  string       // image/file: original file name, advisory (used by folder/save sinks)
   // exactly one of the following, per `type`:
   text?:      string       // type=text: the UTF-8 payload, inline
-  blob?: {                 // type=image: content-addressed reference
-    hash:     string       // BLAKE3 hex of the PNG bytes — also the integrity check
-    size:     u64          // PNG byte length
-    w:        u32
-    h:        u32
+  blob?: {                 // type=image|file: content-addressed reference
+    hash:     string       // BLAKE3 hex of the bytes — also the integrity check
+    size:     u64          // byte length
+    w?:       u32          // image only
+    h?:       u32          // image only
   }
 }
 ```
 
 Rules:
-- **Text** payloads ride **inline** in `text`. (A soft cap of 1 MiB inline; larger text may be sent as a blob with
+- **`text`** payloads ride **inline** in `text`. (A soft cap of 1 MiB inline; larger text may be sent as a blob with
   `mime: text/plain` at the impl's discretion — not required for Phase 0.)
-- **Images** are **always PNG on the wire.** The sender encodes to PNG (from raw RGBA / whatever the OS clipboard
-  gave it); the receiver decodes PNG → the OS-native clipboard image format. `blob.hash` is BLAKE3 of the exact
-  PNG bytes and MUST be verified on receipt.
-- Image bytes are **not** flooded through a gossip/broadcast channel. The sender broadcasts the small envelope
-  (announcement); each receiver **pulls** the PNG bytes over a direct stream keyed by `blob.hash` (mesh: iroh-blobs
+- **`image`** is **always PNG on the wire** and is the only type that can be pasted into the OS clipboard *as an image*.
+  The sender encodes to PNG; the receiver decodes PNG → the OS-native clipboard image format. `blob.hash` is BLAKE3 of
+  the exact PNG bytes and MUST be verified on receipt.
+- **`file`** is arbitrary bytes with a best-effort `mime` and a `filename`. It is content-addressed like an image but is
+  **not** clipboard-pasteable; it is routed to the folder sink (see SPEC §3) or `recv --emit-path`. `blob.hash` verified on receipt.
+- Image/file bytes are **not** flooded through a gossip/broadcast channel. The sender broadcasts the small envelope
+  (announcement); each receiver **pulls** the bytes over a direct stream keyed by `blob.hash` (mesh: iroh-blobs
   or a direct QUIC stream; room: fetch from the server). Experiments MAY inline-chunk small images for simplicity.
 - **Phase 0 inline extension:** an impl MAY carry the PNG bytes inline in an optional `blob_data` field (alongside
   `blob.hash`/`size`/`w`/`h`) instead of announce+pull, for small test images. PNG stays canonical and `blob.hash`
@@ -46,10 +49,13 @@ Rules:
 
 ## 2. Type sniffing (`--auto`)
 
-- If the first bytes match a **PNG** signature (`89 50 4E 47 0D 0A 1A 0A`) or **JPEG** (`FF D8 FF`) → treat as image.
-  JPEG is transcoded to PNG before sending (canonical wire format is PNG).
-- Else if the whole payload is valid UTF-8 → treat as text.
-- Else → error (`2`), unless `--image` forces raw bytes (future: arbitrary blobs).
+- If a path argument or `--name` is given, `filename` is set from it.
+- If the first bytes match a **PNG** signature (`89 50 4E 47 0D 0A 1A 0A`) or **JPEG** (`FF D8 FF`) → treat as image
+  (JPEG transcoded to PNG, the canonical wire format). `--image` forces image.
+- Else if `--file` is set (or a binary/non-UTF-8 payload is piped with a `--name`) → treat as **file**
+  (`application/octet-stream` unless a better mime is known from the extension).
+- Else if the whole payload is valid UTF-8 → treat as **text**. `--text` forces text.
+- Else (binary, no `--file`/`--name`) → treat as **file** with `application/octet-stream`.
 
 ## 3. Identity, rooms, trust
 
