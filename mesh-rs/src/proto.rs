@@ -116,6 +116,9 @@ pub enum Req {
     /// Copy a *specific* buffered item (by ULID) to the OS clipboard. Used by the TUI's `y`
     /// key so the highlighted bubble — not just the latest — can be placed on the clipboard.
     PasteItem { msg_id: String },
+    /// TUI Ctrl+V: read whatever image is on the local OS clipboard and broadcast it as an
+    /// image item. The daemon owns arboard, so it does the read — the TUI stays a thin front-end.
+    SendClipboardImage,
     Subscribe,
     Peers,
     Status,

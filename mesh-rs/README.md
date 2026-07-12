@@ -228,6 +228,7 @@ Keybindings:
 | Key | Action |
 |---|---|
 | type + `Enter` | Send the line as a text item; it appears immediately as your own bubble. |
+| `Ctrl-V` (compose) | Send whatever image is on the local OS clipboard — the daemon (arboard owner) reads it and broadcasts it as an image item; the composer stays text-only. Headless → a clean "clipboard unavailable" toast, no panic. |
 | `Esc` | Toggle focus between the **composer** and **browse** mode. |
 | `↑` / `↓` (or `k` / `j` in browse) | Move the highlight over messages. |
 | `y` | Copy the highlighted (or latest) item to the OS clipboard **via the daemon** (a `file` copies its path as text). |
@@ -281,7 +282,8 @@ clip --config-dir /tmp/b --socket /tmp/b.sock --room demo paste    # -> pbpaste 
   `wayland-data-control` are Phase 1/3.
 - **TUI** (ratatui) — **built** (Phase 2): `clip tui`, a messenger-style chat over the daemon's
   event stream with inline image thumbnails (Kitty/iTerm2/Sixel → Unicode half-blocks). See the
-  [Messenger TUI](#messenger-tui-clip-tui) section above. Pasting an image *into* the composer is
-  not wired yet (send images with `clip send --image`).
+  [Messenger TUI](#messenger-tui-clip-tui) section above. **Ctrl-V** in the composer sends the OS
+  clipboard image (the daemon reads it via arboard); dragging/pasting a file path into the composer
+  is not wired (send arbitrary files with `clip send --image`/`--file`).
 - **Trust**: Phase 0 auto-allowlists any peer you pair/connect with. TOFU-with-approval (holding
   first contact pending) is Phase 1.

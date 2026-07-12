@@ -104,6 +104,8 @@ enum KeyOutcome {
     Redraw,
     Quit,
     Send(Outgoing),
+    /// Ctrl+V in the composer: ask the daemon to broadcast the local OS clipboard image.
+    SendClipboardImage,
     Copy,
     Save,
     Open,
@@ -186,6 +188,17 @@ impl App {
             // in-TUI "press y" affordance emitted from `push_incoming`, so we drop it here.
             Event::Toast { .. } => false,
         }
+    }
+
+    /// Refresh the live header facts from a periodic `Status` poll: peer count, clipboard
+    /// availability, auto_copy mode, and room. This is the fallback that keeps the header honest
+    /// when a `PeerUp`/`PeerDown` event never reaches the subscription (those still fire the
+    /// instant connect/disconnect toasts).
+    fn apply_status(&mut self, s: StatusInfo) {
+        self.header.peer_count = s.peer_count;
+        self.header.clipboard_available = s.clipboard == "available";
+        self.header.auto_copy = s.auto_copy;
+        self.header.room = s.room;
     }
 
     fn push_incoming(&mut self, env: Envelope, local_path: Option<String>) {
@@ -385,32 +398,39 @@ impl App {
         }
 
         match self.focus {
-            Focus::Compose => match key.code {
-                KeyCode::Enter => match self.submit_text() {
-                    Some(o) => KeyOutcome::Send(o),
-                    None => KeyOutcome::None,
-                },
-                KeyCode::Esc => {
-                    self.focus = Focus::Browse;
-                    if self.selected.is_none() && !self.messages.is_empty() {
-                        self.follow = false;
-                        self.selected = Some(self.messages.len() - 1);
+            Focus::Compose => {
+                // Ctrl+V is intercepted before the composer consumes it: send the local OS
+                // clipboard image via the daemon (the composer stays text-only).
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('v') {
+                    return KeyOutcome::SendClipboardImage;
+                }
+                match key.code {
+                    KeyCode::Enter => match self.submit_text() {
+                        Some(o) => KeyOutcome::Send(o),
+                        None => KeyOutcome::None,
+                    },
+                    KeyCode::Esc => {
+                        self.focus = Focus::Browse;
+                        if self.selected.is_none() && !self.messages.is_empty() {
+                            self.follow = false;
+                            self.selected = Some(self.messages.len() - 1);
+                        }
+                        KeyOutcome::Redraw
                     }
-                    KeyOutcome::Redraw
+                    KeyCode::Up => {
+                        self.select_up();
+                        KeyOutcome::Redraw
+                    }
+                    KeyCode::Down => {
+                        self.select_down();
+                        KeyOutcome::Redraw
+                    }
+                    _ => {
+                        self.composer.input(ev.clone());
+                        KeyOutcome::Redraw
+                    }
                 }
-                KeyCode::Up => {
-                    self.select_up();
-                    KeyOutcome::Redraw
-                }
-                KeyCode::Down => {
-                    self.select_down();
-                    KeyOutcome::Redraw
-                }
-                _ => {
-                    self.composer.input(ev.clone());
-                    KeyOutcome::Redraw
-                }
-            },
+            }
             Focus::Browse => match key.code {
                 KeyCode::Esc | KeyCode::Char('i') => {
                     self.focus = Focus::Compose;
@@ -471,9 +491,13 @@ struct ResizeJob {
 /// Results of the async IPC commands (send/copy/save/open) routed back to the UI loop.
 enum CmdResult {
     Sent { seq: u64, result: Result<(String, usize), String> },
+    /// Result of a Ctrl+V clipboard-image send (no optimistic bubble — just a toast).
+    ClipboardImageSent(Result<(String, usize), String>),
     Copied { msg_id: String, result: Result<String, String> },
     Saved(Result<String, String>),
     Opened(Result<String, String>),
+    /// A periodic status poll refreshed the header facts.
+    Status(StatusInfo),
 }
 
 enum DaemonMsg {
@@ -611,6 +635,9 @@ async fn event_loop(
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CmdResult>();
 
     let mut tick = tokio::time::interval(Duration::from_millis(300));
+    // Periodic status poll (SPEC §4): keeps the header (peers / clipboard / auto_copy) honest even
+    // if a PeerUp/PeerDown event never reaches the subscription. Routed back as CmdResult::Status.
+    let mut status_poll = tokio::time::interval(Duration::from_secs(2));
 
     loop {
         terminal.draw(|f| ui(f, &app, &mut images, &resize_tx))?;
@@ -628,6 +655,7 @@ async fn event_loop(
                         app.should_quit = true;
                     }
                     KeyOutcome::Send(o) => spawn_send(paths, &cmd_tx, o),
+                    KeyOutcome::SendClipboardImage => spawn_send_clipboard_image(paths, &cmd_tx),
                     KeyOutcome::Copy => do_copy(&mut app, paths, &cmd_tx),
                     KeyOutcome::Save => do_save(&mut app, paths, &cmd_tx),
                     KeyOutcome::Open => do_open(&mut app, paths, &cmd_tx),
@@ -647,6 +675,7 @@ async fn event_loop(
             },
             Some(ie) = img_rx.recv() => apply_img_event(&mut images, ie),
             Some(cr) = cmd_rx.recv() => apply_cmd_result(&mut app, cr),
+            _ = status_poll.tick() => spawn_status(paths, &cmd_tx),
             _ = tick.tick() => { app.expire_toast(); }
         }
     }
@@ -670,6 +699,11 @@ fn apply_img_event(images: &mut HashMap<String, ImgState>, ie: ImgEvent) {
 fn apply_cmd_result(app: &mut App, cr: CmdResult) {
     match cr {
         CmdResult::Sent { seq, result } => app.on_sent_result(seq, result),
+        CmdResult::ClipboardImageSent(Ok((_msg_id, reached))) => {
+            let note = if reached == 0 { " (no peers)" } else { "" };
+            app.set_toast(format!("sent clipboard image{note}"));
+        }
+        CmdResult::ClipboardImageSent(Err(e)) => app.set_toast(e),
         CmdResult::Copied { msg_id, result } => match result {
             Ok(desc) => {
                 app.mark_copied(&msg_id);
@@ -681,6 +715,7 @@ fn apply_cmd_result(app: &mut App, cr: CmdResult) {
         CmdResult::Saved(Err(e)) => app.set_toast(format!("save failed: {e}")),
         CmdResult::Opened(Ok(path)) => app.set_toast(format!("opened {path}")),
         CmdResult::Opened(Err(e)) => app.set_toast(format!("open failed: {e}")),
+        CmdResult::Status(s) => app.apply_status(s),
     }
 }
 
@@ -708,6 +743,36 @@ fn spawn_send(paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdResult>, o: Outgo
             Err(e) => Err(e.to_string()),
         };
         let _ = tx.send(CmdResult::Sent { seq: o.seq, result: out });
+    });
+}
+
+/// Ctrl+V: ask the daemon (the arboard owner) to read the local OS clipboard image and broadcast
+/// it as an image item. The result becomes a toast — no optimistic bubble, since the TUI never
+/// holds the image bytes itself.
+fn spawn_send_clipboard_image(paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdResult>) {
+    let paths = paths.clone();
+    let tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        let res = request(&paths, Req::SendClipboardImage).await;
+        let out = match res {
+            Ok(Resp::Ok(OkData::Sent { msg_id, reached })) => Ok((msg_id, reached)),
+            Ok(Resp::Err { message, .. }) => Err(message),
+            Ok(_) => Err("unexpected send response".to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(CmdResult::ClipboardImageSent(out));
+    });
+}
+
+/// Poll `Status` and route the fresh facts back as `CmdResult::Status` (header refresh). Failures
+/// are silently dropped — the next tick tries again.
+fn spawn_status(paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdResult>) {
+    let paths = paths.clone();
+    let tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        if let Ok(Resp::Ok(OkData::Status(s))) = request(&paths, Req::Status).await {
+            let _ = tx.send(CmdResult::Status(s));
+        }
     });
 }
 
@@ -1102,7 +1167,7 @@ fn build_lines(app: &App, width: usize, now: u64) -> (Vec<Line<'static>>, Vec<Bl
 fn render_composer(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Compose;
     let title = if focused {
-        " compose (Enter=send · Esc=browse) "
+        " compose (Enter=send · ^V=image · Esc=browse) "
     } else {
         " compose (Esc/i to focus) "
     };
@@ -1133,7 +1198,7 @@ fn render_hint(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Line::from(
             Span::raw(
-                " Enter send · Esc browse/compose · ↑↓/kj select · y copy · s save · o open · q quit",
+                " Enter send · ^V send image · Esc browse/compose · ↑↓/kj select · y copy · s save · o open · q quit",
             )
             .dim(),
         )
@@ -1559,6 +1624,40 @@ mod tests {
         let outcome = app.handle_key(&key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert_eq!(outcome, KeyOutcome::Redraw);
         assert!(!app.composer.is_empty(), "'q' should be typed into the composer");
+    }
+
+    /// Ctrl+V in the composer is intercepted before the text area and asks the IO shell to send
+    /// the local OS clipboard image (Feature B, pure-model seam).
+    #[test]
+    fn ctrl_v_in_compose_sends_clipboard_image() {
+        let mut app = test_app();
+        assert!(app.focus == Focus::Compose);
+        assert_eq!(
+            app.handle_key(&key(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            KeyOutcome::SendClipboardImage
+        );
+        assert!(app.composer.is_empty(), "Ctrl+V must not type into the composer");
+    }
+
+    /// A periodic status poll refreshes the header facts (peer count et al.) — the fallback that
+    /// keeps the header honest when PeerUp/PeerDown never reach the subscription (Feature A).
+    #[test]
+    fn apply_status_updates_peer_count() {
+        let mut app = test_app();
+        assert_eq!(app.header.peer_count, 1);
+        app.apply_status(StatusInfo {
+            endpoint_id: "MYENDPOINTID0000".into(),
+            device_name: "dev".into(),
+            room: "default".into(),
+            transport: "lan".into(),
+            auto_copy: "on".into(),
+            clipboard: "unavailable".into(),
+            peer_count: 4,
+            buffer_len: 0,
+        });
+        assert_eq!(app.header.peer_count, 4);
+        assert_eq!(app.header.auto_copy, "on");
+        assert!(!app.header.clipboard_available);
     }
 
     /// Exercise the exact image pipeline the workers run (decode → protocol → off-thread

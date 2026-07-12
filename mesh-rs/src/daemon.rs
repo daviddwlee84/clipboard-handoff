@@ -661,6 +661,25 @@ impl Daemon {
         reached
     }
 
+    /// Broadcast PNG bytes as an image item exactly like a `send --image`: content-address the
+    /// blob, announce the envelope, record it as locally-sent (so the TUI can `PasteItem` it back),
+    /// and report reach. Shared by `Req::Send`'s image arm and `Req::SendClipboardImage`.
+    async fn broadcast_image(&self, png: Vec<u8>, w: u32, h: u32, filename: Option<String>) -> OkData {
+        let hash = blake3_hex(&png);
+        self.blobs.lock().unwrap().insert(hash.clone(), png.clone());
+        let mut env = self.base_envelope(MsgType::Image, "image/png");
+        env.filename = filename;
+        env.blob = Some(Blob {
+            hash,
+            size: png.len() as u64,
+            w,
+            h,
+        });
+        let n = self.broadcast(&env).await;
+        self.record_sent(&env, None);
+        OkData::Sent { msg_id: env.msg_id, reached: n }
+    }
+
     // ---- IPC (client <-> daemon) -----------------------------------------
 
     async fn handle_ipc(self: Arc<Self>, mut stream: IpcStream) -> Result<()> {
@@ -677,19 +696,7 @@ impl Daemon {
                         Resp::Ok(OkData::Sent { msg_id: env.msg_id, reached: n })
                     }
                     Ok(Sniffed::Image { png, w, h }) => {
-                        let hash = blake3_hex(&png);
-                        self.blobs.lock().unwrap().insert(hash.clone(), png.clone());
-                        let mut env = self.base_envelope(MsgType::Image, "image/png");
-                        env.filename = name;
-                        env.blob = Some(Blob {
-                            hash,
-                            size: png.len() as u64,
-                            w,
-                            h,
-                        });
-                        let n = self.broadcast(&env).await;
-                        self.record_sent(&env, None);
-                        Resp::Ok(OkData::Sent { msg_id: env.msg_id, reached: n })
+                        Resp::Ok(self.broadcast_image(png, w, h, name).await)
                     }
                     Ok(Sniffed::File { bytes, mime }) => {
                         let hash = blake3_hex(&bytes);
@@ -819,6 +826,30 @@ impl Daemon {
                         None => Resp::Err {
                             code: 5,
                             message: "item no longer buffered".into(),
+                        },
+                    }
+                };
+                write_frame(&mut stream, &resp).await?;
+            }
+            Req::SendClipboardImage => {
+                // The TUI's Ctrl+V: the daemon (arboard owner) reads the OS clipboard image and
+                // broadcasts it exactly like `send --image`. Headless → clean error, never a panic.
+                let resp = if !self.clipboard_available {
+                    Resp::Err {
+                        code: 1,
+                        message: "clipboard unavailable (headless)".into(),
+                    }
+                } else {
+                    // arboard is blocking and not Send: read on the blocking pool.
+                    match tokio::task::spawn_blocking(clipboard::read_image).await {
+                        Ok(Some((png, w, h))) => Resp::Ok(self.broadcast_image(png, w, h, None).await),
+                        Ok(None) => Resp::Err {
+                            code: 5,
+                            message: "no image on the clipboard".into(),
+                        },
+                        Err(_) => Resp::Err {
+                            code: 1,
+                            message: "clipboard read task panicked".into(),
                         },
                     }
                 };

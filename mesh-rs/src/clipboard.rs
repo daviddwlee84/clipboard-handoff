@@ -44,6 +44,25 @@ pub enum Payload {
     ImagePng(Vec<u8>),
 }
 
+/// Read an image off the OS clipboard as PNG bytes: arboard `get_image()` → RGBA → PNG-encode.
+/// Returns `(png, w, h)`, or `None` when there is no image, the host is headless/forced, or any
+/// step fails (never panics). Blocking + arboard's `Clipboard` isn't `Send`, so run the whole op
+/// inside `spawn_blocking` at the call site.
+pub fn read_image() -> Option<(Vec<u8>, u32, u32)> {
+    if force_headless() {
+        return None;
+    }
+    let mut cb = arboard::Clipboard::new().ok()?;
+    let img = cb.get_image().ok()?;
+    let (w, h) = (img.width as u32, img.height as u32);
+    let rgba = image::RgbaImage::from_raw(w, h, img.bytes.into_owned())?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some((png, w, h))
+}
+
 /// Write `payload` to the OS clipboard. Returns `Err` (never panics) when the clipboard is
 /// unavailable (headless / forced) or the op fails. Blocking; call from `spawn_blocking`.
 pub fn write(payload: Payload) -> Result<()> {
@@ -84,5 +103,28 @@ mod tests {
             "expected a clear 'clipboard unavailable' error, got: {err}"
         );
         unsafe { std::env::remove_var(FORCE_HEADLESS_ENV) };
+    }
+
+    /// Round-trips a real image through the OS clipboard: write PNG → read it back with
+    /// `read_image` → decode. Touches the live clipboard, so it is `#[ignore]`d (run manually
+    /// with `cargo test -- --ignored read_image_round_trips`). Confirms Feature B's daemon-side
+    /// read produces a valid PNG of the right dimensions from whatever is on the clipboard.
+    #[test]
+    #[ignore = "touches the live OS clipboard"]
+    fn read_image_round_trips_through_the_clipboard() {
+        let mut png = Vec::new();
+        let src = image::RgbaImage::from_pixel(37, 19, image::Rgba([12, 200, 90, 255]));
+        image::DynamicImage::ImageRgba8(src)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        write(Payload::ImagePng(png)).expect("write image to clipboard");
+
+        let (out_png, w, h) = read_image().expect("an image must be readable back off the clipboard");
+        assert_eq!((w, h), (37, 19), "dimensions must survive the clipboard round-trip");
+        let decoded = image::load_from_memory(&out_png).expect("read_image must yield valid PNG");
+        assert_eq!(
+            (image::GenericImageView::width(&decoded), image::GenericImageView::height(&decoded)),
+            (37, 19)
+        );
     }
 }
