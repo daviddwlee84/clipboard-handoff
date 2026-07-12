@@ -32,6 +32,7 @@ Binary names: `mesh-rs` → `clip`, `room-go` → `room`, `experiments/lan-go` �
 | `BIN status` | Show daemon state: identity, transport mode (lan/internet), auto_copy setting, peer count, buffer size. |
 | `BIN config set KEY VALUE` / `BIN config get KEY` | Persist settings (see §5). |
 | `BIN daemon [--foreground]` · `BIN daemon stop` | Run the resident daemon (normally auto-spawned; `--foreground` for debugging). `daemon stop` shuts it down, applying `clear_on_exit` (§8). |
+| `BIN remote <ssh-host> [up\|down] [--room R]` | VSCode-Remote-style: bootstrap this tool on an SSH host (install to `~/.local/bin`) and connect — **room** = SSH tunnel + join, **clip** = iroh ticket pair, **lan** = mDNS on the shared LAN. `room` is native Go; `clip`/`lan` share `scripts/remote.sh`. |
 
 **Exit codes:** `0` success · `1` generic error · `2` usage error · `3` no daemon / cannot reach daemon ·
 `4` reserved · `5` nothing to paste/recv. **`send` with no connected peers exits `0`** with a stderr warning

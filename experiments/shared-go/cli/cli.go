@@ -80,6 +80,8 @@ func (g Globals) dispatch(sub string, args []string) int {
 		return g.cmdConfig(args)
 	case "pair", "join":
 		return g.cmdPair(args)
+	case "remote":
+		return g.cmdRemote(args)
 	case "help", "-h", "--help":
 		g.app.usage()
 		return 0
@@ -698,5 +700,6 @@ Commands:
   peers    [--json]
   config   set KEY VALUE | get KEY        keys: auto_copy, save_dir, text_file, clear_on_exit, …
   pair                                    no-op: discovery is automatic (mDNS)
+  remote   <ssh-host> [up|down]            bootstrap + connect a remote over SSH (shared engine)
 `, a.BinName, a.Tagline, a.BinName)
 }

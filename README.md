@@ -56,6 +56,20 @@ clip clear --all                         # clear what this session received (pro
 Connecting devices: `mesh-rs`/`lan-go` **auto-discover** peers in the same `--room` on a LAN (mDNS; `clip pair`
 gives a ticket as a fallback). `room-go` clients `join room@host:port` on a server you run.
 
+**One-command remote (VSCode-Remote style):** point a tool at an SSH host (key auth via `~/.ssh/config`) and it
+installs itself there, starts the remote side, and connects — no manual steps:
+
+```sh
+room remote  my-server        # install room on my-server, start a room server, SSH tunnel, join
+clip remote  my-server        # install clip, start a remote daemon, pair over iroh (direct QUIC)
+lan  remote  my-server        # install lan, start a remote daemon (mDNS on a shared LAN)
+<tool> remote my-server down  # disconnect / tear down
+# just remote clip my-server   ·   just install-remote my-server room lan
+```
+`room remote` is native Go; `clip`/`lan` share one engine (`scripts/remote.sh`), and `scripts/install.sh` puts it
+next to the binaries so it works from `~/.local/bin`. (Binary bootstrap needs the repo or a matching-arch host;
+the QUIC mesh tools connect on a shared LAN — cross-internet is the relay path, still LAN-first for now.)
+
 ## The one cross-cutting truth
 
 > **Images/files can only land on a device's OS clipboard via a native, resident agent on that device.**

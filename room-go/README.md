@@ -175,6 +175,7 @@ $BIN "${A[@]}" daemon --foreground --server room@localhost:$PORT
 | `room server [--addr :2222] [--host-key PATH] [--authorized-keys FILE]` | run the SSH room server |
 | `room daemon [--foreground] [--server user@host:port]` | run the client daemon (usually auto-spawned) |
 | `room join <user@host:port>` | generate/print the client key fingerprint, connect the daemon to a server+room |
+| `room remote <ssh-host> [--rport N] [--lport N] [--stop]` | one-command SSH-tunnel connect: install+start a server on the host, tunnel to it, join (see below) |
 | `room send [PATH] [--text\|--image\|--file\|--auto] [--name NAME]` | read PATH or stdin, sniff type, broadcast |
 | `room recv [--follow] [--latest-image --emit-path] [--out PATH]` | text→stdout, image/file→file path |
 | `room tui` | messenger-style chat attached to the local daemon (SPEC §4) |
@@ -188,6 +189,60 @@ Global flags (before the subcommand): `--config-dir PATH`, `--socket PATH`,
 `--room NAME`, `--json`, `-q/--quiet`, `-v/--verbose`. Exit codes follow SPEC §2
 (`0` ok · `2` usage · `3` no daemon · `4` no peers/not connected — a send
 warning · `5` nothing to paste/recv).
+
+## Remote (SSH tunnel) — one-command connect
+
+`room remote <ssh-host>` is a VSCode-Remote-SSH-style shortcut: point it at a
+host you already have in `~/.ssh/config` (key auth) and it stands up the whole
+room-over-SSH path for you — no manual server/scp/tunnel steps.
+
+```sh
+# host is any ~/.ssh/config alias (keys/agent/ProxyJump all Just Work)
+room --room demo remote my-server
+# → connected to my-server via SSH tunnel (room "demo") — send/recv/tui now reach it
+
+# now the normal thin clients reach the remote room through the tunnel:
+printf hi | room --room demo send --text
+room --room demo tui
+
+room remote my-server --stop         # tear it down
+```
+
+It shells out to the local `ssh`/`scp` binaries (never reimplementing SSH, so
+your config, keys, and agent apply) and does, idempotently:
+
+1. **Detect** the remote arch — `ssh <host> uname -sm` → GOOS/GOARCH
+   (Linux `x86_64`→`linux/amd64`, `aarch64`→`arm64`, Darwin→`darwin`).
+2. **Ensure `~/.local/bin/room`** on the host. If missing it **bootstraps**:
+   cross-builds `room` for the remote GOOS/GOARCH with `CGO_ENABLED=0` using the
+   local `go` toolchain (the module is located by walking up from the CWD for
+   `go.mod`). If there's no module *and* the local host already matches the
+   remote arch, it falls back to `scp`-ing the running executable
+   (`os.Executable()`); otherwise it fails with an actionable message ("run from
+   inside the room-go repo"). Then `mkdir -p ~/.local/bin`, `scp`, `chmod +x`.
+3. **Start a room server on the remote, bound to loopback** — reused if already
+   listening on `--rport` (default `2299`), else started detached
+   (`setsid nohup ~/.local/bin/room server --addr 127.0.0.1:<rport>
+   --host-key ~/.config/room/host_key >/tmp/room-remote-server.log 2>&1 &`).
+4. **Open the tunnel** — a backgrounded `ssh -N -L <lport>:127.0.0.1:<rport>
+   <host>` (default lport `2299`, auto-bumped if the local port is busy). Its
+   pid is tracked in a per-host state file under `<config-dir>/remote/`.
+5. **Connect locally** — ensures the local client daemon and joins
+   `room@127.0.0.1:<lport>` (room from `--room`, default `default`).
+
+`room remote <host> --stop` kills the tunnel, stops the remote server if this
+command started it, and removes the state file. Re-running `room remote` reuses
+an installed binary, a running server, and a live tunnel, so it is safe to run
+repeatedly.
+
+**Flags:** `--rport N` (remote server loopback port, default 2299) ·
+`--lport N` (local tunnel port, default 2299) · `--stop` (tear down). The room
+name comes from the global `--room` flag.
+
+**Phase 0 scope:** the daemon still trusts the server host key on connect
+(`InsecureIgnoreHostKey`, fine for a loopback tunnel); host-key pinning is
+Phase 1. `--stop` leaves the installed `~/.local/bin/room` in place by design
+(that's the point — the next connect is instant).
 
 ## The messenger TUI (`room tui`)
 

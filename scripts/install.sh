@@ -82,7 +82,7 @@ build_clip(){
     say "clip: building on $REMOTE (cargo; this compiles iroh, be patient)…"
     ssh -o BatchMode=yes "$REMOTE" 'command -v ~/.cargo/bin/cargo >/dev/null || command -v cargo >/dev/null' \
       || die "clip --remote needs a cargo toolchain on $REMOTE (install rustup)"
-    rsync -a --delete --exclude target/ "$ROOT/mesh-rs/" "$REMOTE:cpc-build/mesh-rs/" >/dev/null
+    rsync -a --delete --exclude target/ --rsync-path='mkdir -p cpc-build/mesh-rs && rsync' "$ROOT/mesh-rs/" "$REMOTE:cpc-build/mesh-rs/" >/dev/null
     ssh "$REMOTE" 'cd cpc-build/mesh-rs && ${HOME}/.cargo/bin/cargo build --release'
     ssh "$REMOTE" "install -m 0755 cpc-build/mesh-rs/target/release/clip '$PREFIX/clip'"
     say "installed clip → $REMOTE:$PREFIX/clip"
@@ -102,6 +102,20 @@ for t in "${TOOLS[@]}"; do
     clip) build_clip;;
   esac
 done
+
+# Install the shared remote engine (+ this installer) so `<tool> remote <host>`
+# can find it from ~/.local/bin even outside the repo.
+LIBEXEC="$(dirname "$PREFIX")/libexec/cpc"
+if [ -n "$REMOTE" ]; then
+  ssh -o BatchMode=yes "$REMOTE" "mkdir -p '$LIBEXEC'"
+  scp -q "$ROOT/scripts/remote.sh" "$ROOT/scripts/install.sh" "$REMOTE:$LIBEXEC/"
+  ssh "$REMOTE" "chmod +x '$LIBEXEC/remote.sh' '$LIBEXEC/install.sh'"
+else
+  mkdir -p "$LIBEXEC"
+  install -m 0755 "$ROOT/scripts/remote.sh" "$LIBEXEC/remote.sh"
+  install -m 0755 "$ROOT/scripts/install.sh" "$LIBEXEC/install.sh"
+fi
+say "installed remote engine → ${REMOTE:+$REMOTE:}$LIBEXEC/remote.sh"
 
 # PATH hint.
 on_path(){ if [ -n "$REMOTE" ]; then ssh "$REMOTE" "case \":\$PATH:\" in *\":$PREFIX:\"*) exit 0;; *) exit 1;; esac"

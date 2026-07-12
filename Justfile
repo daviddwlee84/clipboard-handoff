@@ -54,6 +54,16 @@ sinks impl:
 autodiscover:
     bash mesh-rs/scripts/autodiscover.sh
 
+# Bootstrap a tool on an SSH host + connect (VSCode-Remote style).
+#   `just remote clip local_ubuntu`   /   `just remote room local_ubuntu down`
+remote tool host action="up":
+    #!/usr/bin/env bash
+    if [ "{{tool}}" = room ]; then
+      if [ "{{action}}" = down ]; then ./room-go/bin/room remote {{host}} --stop; else ./room-go/bin/room remote {{host}}; fi
+    else
+      scripts/remote.sh {{tool}} {{host}} {{action}}
+    fi
+
 # Regenerate shared test assets.
 testdata:
     python3 scripts/gen_testdata.py

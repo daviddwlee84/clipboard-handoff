@@ -63,6 +63,8 @@ func dispatch(g Globals, sub string, args []string) int {
 		return cmdDaemon(g, args)
 	case "join":
 		return cmdJoin(g, args)
+	case "remote":
+		return cmdRemote(g, args)
 	case "send":
 		return cmdSend(g, args)
 	case "recv":
@@ -795,6 +797,7 @@ Commands:
   daemon   [--foreground] [--server user@host:port]
   daemon stop
   join     <user@host:port>
+  remote   <ssh-host> [--rport N] [--lport N] [--stop]           (one-command SSH-tunnel connect)
   send     [PATH] [--text|--image|--file|--auto] [--name NAME]   (PATH or stdin)
   recv     [--follow] [--latest-image --emit-path] [--out PATH]
   paste

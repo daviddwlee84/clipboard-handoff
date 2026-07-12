@@ -105,6 +105,14 @@ enum Cmd {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Bootstrap + connect to a remote over SSH (via the shared scripts/remote.sh engine).
+    Remote {
+        /// SSH host (an ~/.ssh/config alias or user@host).
+        host: String,
+        /// Forwarded to the engine: [up|down] [--room R] …
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -146,6 +154,7 @@ async fn main() {
 
 async fn dispatch(cli: Cli, paths: config::Paths) -> Result<i32> {
     let json = cli.json;
+    let room = cli.room.clone();
     match cli.cmd {
         Cmd::Daemon { action: Some(DaemonAction::Stop), .. } => {
             client::cmd_daemon_stop(&paths).await
@@ -178,7 +187,67 @@ async fn dispatch(cli: Cli, paths: config::Paths) -> Result<i32> {
             ConfigAction::Set { key, value } => client::cmd_config_set(&paths, key, value).await,
             ConfigAction::Get { key } => client::cmd_config_get(&paths, key, json).await,
         },
+        Cmd::Remote { host, args } => cmd_remote(&host, &args, &room),
     }
+}
+
+/// `clip remote <host> …` — locate the shared engine (scripts/remote.sh) and exec it
+/// with this tool's name. The engine handles bootstrap + start-remote-daemon + iroh
+/// ticket pairing. Kept out of the binary so all tools share one implementation.
+fn cmd_remote(host: &str, args: &[String], room: &str) -> Result<i32> {
+    use std::os::unix::process::CommandExt;
+    let helper = find_remote_helper().ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not locate remote.sh — set CPC_REMOTE_HELPER, run `scripts/install.sh` \
+             (installs it to ~/.local/libexec/cpc/), or run from the repo"
+        )
+    })?;
+    // exec replaces this process; it only returns on failure. Forward --room:
+    // clap's trailing_var_arg may already carry one (flag after `remote`); only
+    // append the global cli.room otherwise, so the engine never sees two.
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg(&helper).arg("clip").arg(host).args(args);
+    if !args.iter().any(|a| a == "--room") {
+        cmd.arg("--room").arg(room);
+    }
+    let err = cmd.exec();
+    Err(err.into())
+}
+
+fn find_remote_helper() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("CPC_REMOTE_HELPER") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for c in [dir.join("remote.sh"), dir.join("../libexec/cpc/remote.sh")] {
+                if c.is_file() {
+                    return Some(c);
+                }
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let c = PathBuf::from(home).join(".local/libexec/cpc/remote.sh");
+        if c.is_file() {
+            return Some(c);
+        }
+    }
+    if let Ok(mut d) = std::env::current_dir() {
+        loop {
+            let c = d.join("scripts/remote.sh");
+            if c.is_file() {
+                return Some(c);
+            }
+            if !d.pop() {
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// Logs go to **stderr** so client stdout stays clean for `recv`.
