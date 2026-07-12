@@ -1,0 +1,53 @@
+# Cross-machine hand-off, simulated on ONE host: each container is a "device".
+#
+#   docker/build.sh          # cross-compile room + lan into docker/stage/  (run first)
+#   docker compose -f docker/compose.yml up -d --build
+#   docker/demo.sh           # scripted text/image/file hand-off across containers
+#
+# Or via just:  `just up`  /  `just demo`  /  `just down`
+#
+# Topology:
+#   room-go  : server + alice + bob   (central SSH room; alice hands off to bob)
+#   lan-go   : lan-a + lan-b          (mDNS auto-discovery across the docker network)
+
+x-cpc: &cpc
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  image: cpc-sandbox
+  platform: linux/amd64
+  init: true
+  networks: [cpc]
+
+services:
+  # --- room-go: a central server two client "devices" hand off through ---
+  server:
+    <<: *cpc
+    command: ["room", "server", "--addr", ":2299", "--host-key", "/data/hk"]
+
+  alice:
+    <<: *cpc
+    depends_on: [server]
+    command: ["sh", "-c",
+      "room --config-dir /data --socket /data/d.sock --room demo daemon --foreground --server room@server:2299"]
+
+  bob:
+    <<: *cpc
+    depends_on: [server]
+    command: ["sh", "-c",
+      "room --config-dir /data --socket /data/d.sock --room demo daemon --foreground --server room@server:2299"]
+
+  # --- lan-go: two "devices" that auto-discover over mDNS on the docker net ---
+  lan-a:
+    <<: *cpc
+    command: ["sh", "-c",
+      "lan --config-dir /data --socket /data/d.sock --room demo daemon --foreground"]
+
+  lan-b:
+    <<: *cpc
+    command: ["sh", "-c",
+      "lan --config-dir /data --socket /data/d.sock --room demo daemon --foreground"]
+
+networks:
+  cpc:
+    driver: bridge

@@ -1,0 +1,10 @@
+# Keep the Docker build context small & clean (but allow docker/stage + testdata).
+**/target/
+room-go/bin/
+experiments/*/bin/
+.git/
+.specstory/
+scripts/.run/
+node_modules/
+*.db
+*.sock
