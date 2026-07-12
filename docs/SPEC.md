@@ -64,8 +64,8 @@ echo/loop suppression below, and everything written this session is tracked for 
 
 **Echo / loop suppression (required in every mode):**
 1. Dedupe by `msg_id` — never process the same item twice.
-2. Track the content-hash of the last value this daemon **wrote** to its own clipboard; ignore a local clipboard
-   change that equals it (so `on` mode doesn't re-broadcast what it just pasted).
+2. Track the content-hash of the last value this daemon **wrote** to its own clipboard, so a clipboard-watcher
+   won't re-broadcast it. *(Recorded today; only exercised once `broadcast_on_copy` lands — §9.)*
 3. Never re-broadcast an item that was just received. Received ≠ locally-originated.
 
 **Trust:** items are auto-actioned from peers on the **allowlist**. *(Phase 0 trusts all senders that reach the

@@ -22,6 +22,9 @@ you already run a server. `lan` is a bake-off experiment, not a shipping target.
   (§5), OS matrix (§6), sessions & clearing (§8).
 - **[PROTOCOL.md](PROTOCOL.md)** — wire envelope, type sniffing, identity/rooms/trust, local IPC.
 - **[BAKEOFF.md](BAKEOFF.md)** — evaluation rubric, measured facts, and the finalist decision.
+- **[implementation.md](implementation.md)** — how it's actually built: the shared daemon/IPC/envelope
+  architecture, per-impl internals (mesh-rs, room-go, lan-go, parked libp2p-mesh), the cross-transport
+  comparison tables, and the cross-machine / `remote` plumbing. Deeper than the usage guides.
 
 **Per-tool usage guides** (install, connect, full command reference, sinks, sessions, TUI keys,
 troubleshooting):
