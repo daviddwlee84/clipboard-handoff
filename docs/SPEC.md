@@ -85,7 +85,8 @@ Membership itself is already gated: `clip` needs the ticket/room secret, `room` 
 
 *Inline-image parity (Phase 0):* `clip` (mesh-rs) renders real Kitty/iTerm2/Sixel thumbnails with a Unicode
 half-block fallback; `room`/`lan` currently show a metadata placeholder line (`🖼 W×H · size`, `📄 name · size`)
-with the same `y`/`s`/`o` actions — inline pixels are the drop-in next step (§9). Composer image-paste isn't wired yet.
+with the same `y`/`s`/`o` actions (§9). **`clip` sends the OS clipboard image with `Ctrl+V`** (the daemon reads it
+via arboard and broadcasts); `room`/`lan` send images via the CLI (`send --image`).
 
 ## 5. Config keys (persisted in the OS config dir)
 
@@ -158,7 +159,7 @@ image + file, cross-machine, headless). Known deviations from the ideal contract
 | Trust / TOFU | first contact from unknown peer held for approval | membership is gated (ticket / SSH key / room secret), but in-room senders are **trust-all**; per-sender TOFU approval: **planned**. |
 | `peers` | live roster (id, addr, direct/relayed, last-seen) | `clip`/`lan`: real roster. `room`: **status-like** (server keeps no client-visible roster). |
 | TUI inline images | thumbnail (Kitty/iTerm2/Sixel) → half-block → text | `clip`: full (thumbnail + half-block). `room`/`lan`: **placeholder line** + `y`/`s`/`o` actions. |
-| Composer image-paste | paste an image into the composer to send | **not wired** (use `send --image`). |
+| TUI image send | send an image from the TUI | `clip`: **`Ctrl+V`** sends the OS clipboard image. `room`/`lan`: CLI `send --image`. |
 | `internet` / `broadcast_on_copy` | config toggles honored | keys accepted but **not yet acted on** — LAN-first; internet = relay path (deferred). |
 | Image transfer | announce + pull by `blob.hash` | `clip`: pull-by-hash. `room`/`lan`: inline `blob_data` (Phase 0 extension, PROTOCOL §1). |
 | OS coverage | macOS + Linux X11/Wayland + Windows | macOS + Linux X11 verified; headless Linux verified. Wayland/Windows clipboard: **not yet validated**. |
