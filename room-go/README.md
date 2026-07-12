@@ -187,8 +187,8 @@ $BIN "${A[@]}" daemon --foreground --server room@localhost:$PORT
 
 Global flags (before the subcommand): `--config-dir PATH`, `--socket PATH`,
 `--room NAME`, `--json`, `-q/--quiet`, `-v/--verbose`. Exit codes follow SPEC §2
-(`0` ok · `2` usage · `3` no daemon · `4` no peers/not connected — a send
-warning · `5` nothing to paste/recv).
+(`0` ok · `2` usage · `3` no daemon · `4` reserved · `5` nothing to paste/recv).
+`send` with no connected peers exits `0` with a stderr warning (item still buffered).
 
 ## Remote (SSH tunnel) — one-command connect
 

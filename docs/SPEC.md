@@ -27,8 +27,8 @@ Binary names: `mesh-rs` → `clip`, `room-go` → `room`, `experiments/lan-go` �
 | `BIN paste` | Write the **latest received item** into the local OS clipboard (text via set_text, image via set_image; a `file` has no clipboard form — its path is copied as text). This is the "one-key paste" for the default notify-first mode. |
 | `BIN clear [--all] [--yes]` | Clear this session's received data (see §8). Default: **transient** only (fetched-blob cache, emit-path temp files, in-memory buffer). `--all` also reverts session sink writes (truncate `text_file` to session-start, delete files this session wrote to `save_dir`) — prompts unless `--yes`. |
 | `BIN tui` | Launch the messenger-style chat TUI (see §4). |
-| `BIN pair` / `BIN join` | Establish membership. **mesh** (`clip`,`lan`,`libp2p-mesh`): `pair --new` prints a ticket + QR; peer runs `pair <ticket>`; short-code confirm. **room** (`room`): `join <user@server>` using an SSH key. |
-| `BIN peers` | List currently-connected peers (name, id/fingerprint, direct/relayed, last-seen). |
+| `BIN pair` / `BIN join` | Establish membership. **mesh** (`clip`): `pair --new` prints a ticket (`--json` → `{"ticket":…}`); the peer runs `pair <ticket>`. `lan`/`libp2p-mesh` auto-discover over mDNS, so `pair` is a documented no-op. **room** (`room`): `join <user@host:port>` (the SSH key is the identity). *(Planned: QR + short-code verify + TOFU approval — see §9.)* |
+| `BIN peers` | List connected peers (id/fingerprint, address, direct/relayed). **`room` has no client-visible peer roster** (the server only relays), so its `peers` reports connection status like `status` (§9). |
 | `BIN status` | Show daemon state: identity, transport mode (lan/internet), auto_copy setting, peer count, buffer size. |
 | `BIN config set KEY VALUE` / `BIN config get KEY` | Persist settings (see §5). |
 | `BIN daemon [--foreground]` · `BIN daemon stop` | Run the resident daemon (normally auto-spawned; `--foreground` for debugging). `daemon stop` shuts it down, applying `clear_on_exit` (§8). |
@@ -68,8 +68,9 @@ echo/loop suppression below, and everything written this session is tracked for 
    change that equals it (so `on` mode doesn't re-broadcast what it just pasted).
 3. Never re-broadcast an item that was just received. Received ≠ locally-originated.
 
-**Trust:** items are only auto-actioned from peers on the **allowlist**. First contact from an unknown peer is
-held pending explicit approval (TOFU). See PROTOCOL §identity.
+**Trust:** items are auto-actioned from peers on the **allowlist**. *(Phase 0 trusts all senders that reach the
+room; the TOFU allowlist that holds first contact from an unknown peer pending explicit approval is planned — §9.)*
+Membership itself is already gated: `clip` needs the ticket/room secret, `room` authorizes by SSH key.
 
 ## 4. TUI (messenger-style)
 
@@ -82,6 +83,10 @@ held pending explicit approval (TOFU). See PROTOCOL §identity.
   sends it as an image.
 - A toast appears for received items in `notify` mode with a one-key **accept → clipboard**.
 
+*Inline-image parity (Phase 0):* `clip` (mesh-rs) renders real Kitty/iTerm2/Sixel thumbnails with a Unicode
+half-block fallback; `room`/`lan` currently show a metadata placeholder line (`🖼 W×H · size`, `📄 name · size`)
+with the same `y`/`s`/`o` actions — inline pixels are the drop-in next step (§9). Composer image-paste isn't wired yet.
+
 ## 5. Config keys (persisted in the OS config dir)
 
 | Key | Values | Default | Meaning |
@@ -90,13 +95,15 @@ held pending explicit approval (TOFU). See PROTOCOL §identity.
 | `save_dir` | path \| "" | "" | Folder sink: received image/file items written here (§3) |
 | `text_file` | path \| "" | "" | Append sink: received text appended here (§3) |
 | `clear_on_exit` | `ask` \| `transient` \| `all` \| `never` | `ask` | §8 — what a session-end does |
-| `internet` | `on` \| `off` | `off` | LAN-only vs enable relay/hole-punch/global discovery (Phase 3) |
 | `device_name` | string | hostname | Shown to peers |
 | `room` | string | `default` | Default room/topic |
-| `broadcast_on_copy` | `on` \| `off` | `off` | Watch local clipboard and auto-send changes to the mesh (opt-in) |
+| `server` | `user@host:port` \| "" | "" | **`room` only:** the room server the client daemon connects to (set by `join`) |
+| `internet` | `on` \| `off` | `off` | *(planned §9)* LAN-only vs relay/hole-punch/global discovery |
+| `broadcast_on_copy` | `on` \| `off` | `off` | *(planned §9)* watch the local clipboard and auto-send changes |
 
-Config dir: macOS `~/Library/Application Support/<bin>/`, Linux `$XDG_CONFIG_HOME/<bin>/` (or `~/.config/<bin>/`),
-Windows `%APPDATA%\<bin>\`. The IPC socket lives in the OS runtime/temp dir.
+Config dir: macOS `~/Library/Application Support/<dir>/`, Linux `$XDG_CONFIG_HOME/<dir>/` (or `~/.config/<dir>/`),
+Windows `%APPDATA%\<dir>\`, where `<dir>` is the impl's short name — `mesh-rs` for `clip`, `room` for `room`, `lan`
+for `lan`. The IPC socket lives in the OS runtime/temp dir. (`--config-dir`/`--socket` override both.)
 
 ## 6. OS support matrix (target = all first-class)
 
@@ -139,3 +146,24 @@ only) · `all` (transient + session sink writes) · `ask` (prompt if a TTY is at
 
 The daemon records, per session: the transient store location, the `text_file` size at session start, and the list
 of `save_dir` files it wrote — so a clear is precise and reversible-in-scope, never destructive beyond the session.
+
+## 9. Conformance & per-impl deviations (current)
+
+All three impls conform to §2–§8 for the core hand-off (send/recv/paste/tui/clear/config/sinks/sessions, text +
+image + file, cross-machine, headless). Known deviations from the ideal contract above, tracked honestly:
+
+| Area | Contract (ideal) | Current reality |
+|---|---|---|
+| `pair` UX | ticket **+ QR + short-code verify** | `clip`: ticket only (`--json`). `lan`/`libp2p`: no-op (mDNS). QR/short-code: **planned**. |
+| Trust / TOFU | first contact from unknown peer held for approval | membership is gated (ticket / SSH key / room secret), but in-room senders are **trust-all**; per-sender TOFU approval: **planned**. |
+| `peers` | live roster (id, addr, direct/relayed, last-seen) | `clip`/`lan`: real roster. `room`: **status-like** (server keeps no client-visible roster). |
+| TUI inline images | thumbnail (Kitty/iTerm2/Sixel) → half-block → text | `clip`: full (thumbnail + half-block). `room`/`lan`: **placeholder line** + `y`/`s`/`o` actions. |
+| Composer image-paste | paste an image into the composer to send | **not wired** (use `send --image`). |
+| `internet` / `broadcast_on_copy` | config toggles honored | keys accepted but **not yet acted on** — LAN-first; internet = relay path (deferred). |
+| Image transfer | announce + pull by `blob.hash` | `clip`: pull-by-hash. `room`/`lan`: inline `blob_data` (Phase 0 extension, PROTOCOL §1). |
+| OS coverage | macOS + Linux X11/Wayland + Windows | macOS + Linux X11 verified; headless Linux verified. Wayland/Windows clipboard: **not yet validated**. |
+| `remote` | one command per tool | `room` native (SSH tunnel); `clip`/`lan` via `scripts/remote.sh` (ticket / mDNS). Bootstrap needs the repo or a matching-arch host. |
+
+"Planned"/"deferred" items are intentionally out of the current scope (LAN-first, Phase-0-plus). See
+[`implementation.md`](implementation.md) for how each impl is actually built and [`BAKEOFF.md`](BAKEOFF.md) for the
+measured comparison.
