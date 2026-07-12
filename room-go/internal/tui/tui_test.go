@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"sync"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,8 +11,11 @@ import (
 )
 
 // fakeClient records daemon calls so Update can be exercised without a live
-// daemon / socket.
+// daemon / socket. Its methods are mutex-guarded because the teatest render
+// tests (render_test.go) drive the model through a real bubbletea program whose
+// commands call these methods from background goroutines.
 type fakeClient struct {
+	mu     sync.Mutex
 	sent   []string
 	copies []copyCall
 	clears []bool // Clear(all) calls, in order
@@ -20,13 +24,33 @@ type fakeClient struct {
 
 type copyCall struct{ msgID, fallback string }
 
-func (f *fakeClient) Status() (*ipc.Status, error)      { return f.status, nil }
-func (f *fakeClient) SendText(t string) (string, error) { f.sent = append(f.sent, t); return "", nil }
+func (f *fakeClient) Status() (*ipc.Status, error) { return f.status, nil }
+func (f *fakeClient) SendText(t string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, t)
+	return "", nil
+}
 func (f *fakeClient) Copy(msgID, fallback string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.copies = append(f.copies, copyCall{msgID, fallback})
 	return nil
 }
-func (f *fakeClient) Clear(all bool) error { f.clears = append(f.clears, all); return nil }
+func (f *fakeClient) Clear(all bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.clears = append(f.clears, all)
+	return nil
+}
+
+// sends returns a snapshot of the recorded SendText calls (safe to read while
+// the program's command goroutines may still be running).
+func (f *fakeClient) sends() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sent...)
+}
 
 func asModel(t *testing.T, tm tea.Model) model {
 	t.Helper()

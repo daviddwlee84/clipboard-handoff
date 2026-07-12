@@ -296,14 +296,39 @@ daemon materialized. Adding an inline preview later is a drop-in change to
 `renderImageBody` (e.g. via `rasterm`) since the local PNG path is already on
 each image bubble.
 
-### Verifying on a real terminal
+### Verifying the TUI (three layers)
 
-bubbletea needs a real TTY, so a non-interactive shell can only drive the model
-headlessly (see `internal/tui/tui_test.go`, which exercises `Update`: an
-incoming item appends a bubble; submitting the composer yields a daemon send; a
-`y` copies by `msg_id`). To see it for real: start the server, `join` two
-daemons to the same room (as above), run `room tui` on each, and type — messages
-appear live on the other side; press `y` on a received bubble to copy it.
+The TUI is covered at three levels of fidelity, so most of it is exercised in
+plain `go test` with no TTY:
+
+1. **Model `Update` unit tests** (`internal/tui/tui_test.go`) — assert on the
+   values `Update` returns: an incoming item appends a bubble; submitting the
+   composer yields a daemon send; `y` copies by `msg_id`; the quit-clear prompt
+   appears only after something was received.
+2. **Rendered-frame tests** (`internal/tui/render_test.go`, `charmbracelet/x/exp/teatest`)
+   — run the model through a simulated 80×24 terminal and assert on the *bytes
+   it renders*: the header (`room:… · 🔑fp · ● server · auto_copy:…`), a received
+   chat bubble (sender + text + the `press y to copy` nudge), the composed own
+   bubble on Enter, and the clear-on-quit prompt. These use
+   `teatest.WaitFor` + substring checks (not a byte-exact golden, which is flaky
+   across terminfo/ANSI); the header's `clipboard:…` field is checked at a wider
+   width where lipgloss doesn't truncate the tail. They run in the default
+   `go test ./...`.
+3. **PTY end-to-end smoke** (`internal/tui/e2e_test.go`, `creack/pty`, **gated**
+   behind the `e2e` build tag) — builds the binary, stands up a `room server` on
+   an isolated loopback port with a client daemon `join`ed to it, launches the
+   built `room tui` under a real pseudo-terminal, reads the header off the PTY,
+   sends `Esc` then `q`, and asserts a clean exit. It does **not** run in the
+   default suite:
+
+   ```sh
+   go test ./...                       # layers 1 + 2 (fast, no TTY)
+   go test -tags e2e ./internal/tui/   # layer 3 (builds the binary + live server/daemon)
+   ```
+
+To see it for real: start the server, `join` two daemons to the same room (as
+above), run `room tui` on each, and type — messages appear live on the other
+side; press `y` on a received bubble to copy it.
 
 ## Wiring the bake-off harness (`scripts/roundtrip.sh`)
 
@@ -356,10 +381,16 @@ internal/clip/       golang.design/x/clipboard wrapper (lazy init; text + PNG)
   **`clear --all`** truncates `text_file` to the session-start offset and removes
   only this-session `save_dir` files (pre-session content untouched); `clipContent`
   type routing (a file copies its path as text).
-- `internal/tui`: bubbletea model `Update` — an incoming-item message appends a
-  bubble; submitting the composer yields a daemon send; `y` copies by `msg_id`;
-  the **quit-clear prompt** appears only after something was received and its
-  `t`/`a`/`n` answers drive the daemon clear.
+- `internal/tui`: three layers (see *Verifying the TUI* above). **Model
+  `Update`** (`tui_test.go`) — an incoming-item message appends a bubble;
+  submitting the composer yields a daemon send; `y` copies by `msg_id`; the
+  **quit-clear prompt** appears only after something was received and its
+  `t`/`a`/`n` answers drive the daemon clear. **Rendered frames**
+  (`render_test.go`, `teatest`, default `go test`) — the header, a received
+  bubble, an own bubble, and the clear prompt actually render. **PTY E2E**
+  (`e2e_test.go`, `-tags e2e`) — the built `room tui` launched under a real
+  pseudo-terminal against a live server + daemon renders its header and quits
+  cleanly.
 
 ## End-to-end (sinks + clear)
 

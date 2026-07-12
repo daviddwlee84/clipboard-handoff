@@ -167,8 +167,43 @@ watch the bubble arrive on the other; select it and press `y`, then confirm with
 - **`libp2p-mesh`** — iroh vs libp2p at the same topology: config surface,
   discovery/dial ergonomics, dependency weight (~38 MB binary).
 
-## Unit tests
+## Tests
+
+Default suite (fast, deterministic, no network/TTY needed):
 
 ```sh
-cd experiments/shared-go && go test ./...   # wire codec/sniff/framing (incl. file envelope), dedupe, sinks + session clear, TUI model
+cd experiments/shared-go && go test ./...   # wire codec/sniff/framing (incl. file envelope), dedupe, sinks + session clear, TUI
 ```
+
+The TUI (shared by both probes) is covered at three layers:
+
+1. **Model `Update` tests** (`shared-go/cli/tui_test.go`) — drive `Update()`
+   directly and assert model state (incoming/own/image bubbles, submit→Send,
+   copy, the quit-clear prompt). No terminal.
+2. **Rendered-frame tests** (`shared-go/cli/tui_render_test.go`) — run the model
+   through a simulated terminal with
+   [`charmbracelet/x/exp/teatest`](https://github.com/charmbracelet/x/tree/main/exp/teatest)
+   and assert on the **bytes lipgloss actually renders**: the header
+   (`room`/`id`/`peers`/`auto_copy`/`clipboard`) and chat bubbles (sender +
+   body). They inject items via `tm.Send(itemMsg{…})`, wait with
+   `teatest.WaitFor` (substring, not strict golden — robust to frame-diff
+   timing), and finish with `Ctrl-C` + `WaitFinished`. Under `go test` stdout is
+   a pipe, so lipgloss uses the Ascii profile (plain text) → matches are
+   reliable. One pinned 80×24 **golden** (`TestRenderGolden`, in
+   `cli/testdata/TestRenderGolden.golden`) captures a full frame; regenerate it
+   after intentional layout changes with:
+
+   ```sh
+   cd experiments/shared-go && go test ./cli/ -run TestRenderGolden -update
+   ```
+
+3. **PTY end-to-end smoke** (`lan-go/e2e/tui_e2e_test.go`, gated behind
+   `//go:build e2e`) — builds `lan`, boots `lan tui` under a real pseudo-terminal
+   via [`creack/pty`](https://github.com/creack/pty), waits for the header to
+   render (the daemon is auto-spawned; peer/mDNS discovery is **not** required),
+   quits, asserts a clean exit, and stops the daemon. Excluded from the default
+   `go test`; run it explicitly:
+
+   ```sh
+   cd experiments/lan-go && go test -tags e2e ./e2e/ -run TestTUIPTYSmoke -v
+   ```

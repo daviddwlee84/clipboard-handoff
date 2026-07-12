@@ -49,5 +49,11 @@ tui-textarea = "0.7.0"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
 [dev-dependencies]
-# Temp dirs for the sink/session (SPEC §3/§8) unit tests.
+# PTY driver for the gated `clip tui` end-to-end test (tests/tui_e2e.rs): spawns the
+# built binary under a pseudo-terminal, expects the header, sends a quit key, and
+# reaps the exit status. Blocking (sync) API — no async runtime needed for the test.
+# The test is #[ignore]d (spawns a daemon + needs a real PTY), so it stays out of the
+# default `cargo test`; run it with `cargo test --test tui_e2e -- --ignored`.
+expectrl = "0.9.0"
+# Temp dirs for the sink/session (SPEC §3/§8) unit tests + the TUI e2e's isolated home.
 tempfile = "3"

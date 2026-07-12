@@ -69,3 +69,17 @@ Manual clipboard path (macOS), which the harness does not exercise:
 `lan … paste` places received text on the clipboard (verified with `pbpaste`);
 `auto_copy on` places a received PNG on the clipboard (PNGf present via
 `osascript`).
+
+## Tests
+
+The TUI is tested in `shared-go` (model + rendered-frame layers, in the default
+`go test ./...`). A gated PTY end-to-end smoke for `lan tui` lives here:
+
+```sh
+cd experiments/lan-go && go test -tags e2e ./e2e/ -run TestTUIPTYSmoke -v
+```
+
+It builds `lan`, boots `lan tui` under a real pseudo-terminal (`creack/pty`),
+waits for the header to render (daemon auto-spawned; no peer required), quits,
+and asserts a clean exit. See [experiments/README.md](../README.md#tests) for the
+full three-layer breakdown.

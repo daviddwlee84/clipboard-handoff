@@ -64,6 +64,20 @@ remote tool host action="up":
       scripts/remote.sh {{tool}} {{host}} {{action}}
     fi
 
+# TUI PTY end-to-end (gated; launches the real binary under a pseudo-terminal): `just tui-e2e mesh-rs`
+tui-e2e impl:
+    #!/usr/bin/env bash
+    case {{impl}} in
+      mesh-rs) cd mesh-rs && cargo test --test tui_e2e -- --ignored --nocapture ;;
+      room-go) cd room-go && go test -tags e2e -v ./internal/tui/ ;;
+      lan-go)  cd experiments/lan-go && go test -tags e2e -v ./e2e/ ;;
+      *) echo "unknown impl: {{impl}} (want mesh-rs|room-go|lan-go)"; exit 2 ;;
+    esac
+
+# mesh-rs inline-image smoke under tmux/zellij (render tests L1 run in `just test`).
+tui-mux:
+    bash mesh-rs/scripts/tui_mux.sh
+
 # Regenerate shared test assets.
 testdata:
     python3 scripts/gen_testdata.py

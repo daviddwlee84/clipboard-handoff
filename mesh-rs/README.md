@@ -253,6 +253,20 @@ that do answer (most modern ones) start instantly.
 Stack: **ratatui 0.29 + ratatui-image 9 + tui-textarea 0.7 + crossterm 0.28**, on the existing tokio
 runtime (pinned as one consistent set; tui-textarea caps ratatui at 0.29).
 
+## TUI tests (three layers)
+
+The `clip tui` code splits a pure `App` model from the IO/render shell, tested in layers:
+
+1. **Model + render (default `cargo test`)** — model-logic tests (`handle_key`/`apply_event`/…) plus
+   **ratatui `TestBackend`** render tests that draw `App` into an in-memory buffer and assert the drawn
+   glyphs (header peer count, bubbles, the `^V send image` hint). Fast, deterministic, no PTY.
+2. **PTY end-to-end (gated `#[ignore]`)** — `tests/tui_e2e.rs` launches the built binary under a real
+   pseudo-terminal (`expectrl`), waits for the header, quits with Ctrl-C, asserts a clean exit:
+   `cargo test --test tui_e2e -- --ignored` (or `just tui-e2e mesh-rs`).
+3. **Multiplexer image smoke** — `scripts/tui_mux.sh` runs `clip tui` inside tmux/zellij, sends it an
+   image, and asserts the image bubble renders without a panic (`just tui-mux`). tmux is the asserting
+   case; zellij is best-effort (its headless scripting is finicky) — verify inline-pixel fidelity visually.
+
 ## Manual smoke test (macOS)
 
 ```sh

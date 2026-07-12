@@ -1686,4 +1686,143 @@ mod tests {
         // …and afterwards the same render area no longer needs work (cheap UI-thread render).
         assert!(proto.needs_resize(&Resize::Fit(None), area).is_none());
     }
+
+    // ----------------------------------------------------------------------
+    // Layer 1 — render tests. These draw the *view* into an in-memory ratatui
+    // `TestBackend` buffer and assert the drawn glyphs (the model-state tests
+    // above never look at what is actually painted). No terminal, no daemon, no
+    // graphics protocol: the half-block picker is never touched for the
+    // header/hint, and with an empty `images` map an image bubble falls back to
+    // its caption placeholder — exactly the "no graphics protocol" path.
+    //
+    // Width note: the header (~92 cols) and the hint (~99 cols) are each a single
+    // NON-wrapping `Paragraph` line, so an 80-col backend would truncate their
+    // tail fragments (`clipboard: available`, `q quit`) off-screen. We render at
+    // 120×24 so every asserted fragment is on-screen; 24 rows is a standard
+    // viewport height. The render is fully deterministic (fixed size, no I/O).
+    use ratatui::{Terminal, backend::TestBackend};
+
+    /// Join every cell's symbol row-by-row into one newline-separated String — the
+    /// literal text a terminal would show. Styling is dropped; we assert on glyphs.
+    /// (Wide graphemes live in their first cell; the trailing skip-cell is empty.)
+    fn rendered(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let w = buf.area.width as usize;
+        let mut out = String::new();
+        for (i, cell) in buf.content.iter().enumerate() {
+            if i > 0 && i % w == 0 {
+                out.push('\n');
+            }
+            out.push_str(cell.symbol());
+        }
+        out
+    }
+
+    /// Draw `app` into a fresh 120×24 in-memory terminal and return the visible text.
+    /// An empty `images` map + a dummy resize channel mirror the IO shell's `ui` call
+    /// with no decoded thumbnails ready (so captions stand in for images).
+    fn draw(app: &App) -> String {
+        let mut images: HashMap<String, ImgState> = HashMap::new();
+        let (resize_tx, _rx) = mpsc::unbounded_channel::<ResizeJob>();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).expect("test terminal");
+        term.draw(|f| ui(f, app, &mut images, &resize_tx)).expect("draw");
+        rendered(&term)
+    }
+
+    fn status_with_peer_count(n: usize) -> StatusInfo {
+        StatusInfo {
+            endpoint_id: "MYENDPOINTID0000".into(),
+            device_name: "dev".into(),
+            room: "default".into(),
+            transport: "lan".into(),
+            auto_copy: "notify".into(),
+            clipboard: "available".into(),
+            peer_count: n,
+            buffer_len: 0,
+        }
+    }
+
+    /// The header row draws every live fact — framed title, room, short id, peer
+    /// count, auto_copy mode, clipboard availability — as painted glyphs.
+    #[test]
+    fn render_header_shows_live_facts() {
+        let out = draw(&test_app());
+        assert!(out.contains("clip · messenger"), "title missing:\n{out}");
+        assert!(out.contains("room default"), "room missing:\n{out}");
+        assert!(out.contains("id MYENDPOINTID"), "short id missing:\n{out}");
+        assert!(out.contains("1 peer(s)"), "peer count missing:\n{out}");
+        assert!(out.contains("auto_copy notify"), "auto_copy missing:\n{out}");
+        assert!(out.contains("clipboard: available"), "clipboard missing:\n{out}");
+    }
+
+    /// A representative App with a peer text bubble: the scrollback draws the
+    /// sender label and the message content.
+    #[test]
+    fn render_text_bubble_shows_sender_and_content() {
+        let mut app = test_app();
+        app.apply_event(Event::Item {
+            envelope: text_env("PEERID", "hello render"),
+            local_path: None,
+        });
+        let out = draw(&app);
+        assert!(out.contains("peer-box"), "sender label missing:\n{out}");
+        assert!(out.contains("hello render"), "bubble content missing:\n{out}");
+    }
+
+    /// With no toast and no quit prompt up, the hint line advertises the key map,
+    /// including its head (`^V send image`) and tail (`q quit`) fragments.
+    #[test]
+    fn render_hint_line_lists_keybindings() {
+        let out = draw(&test_app());
+        assert!(out.contains("^V send image"), "hint head missing:\n{out}");
+        assert!(out.contains("q quit"), "hint tail missing:\n{out}");
+    }
+
+    /// The header is *live*: applying a periodic status poll that bumps the peer
+    /// count to 3 is reflected on the next render (guards the status-refresh path
+    /// that keeps the header honest when a PeerUp/PeerDown event is missed).
+    #[test]
+    fn render_reflects_updated_peer_count() {
+        let mut app = test_app();
+        assert!(draw(&app).contains("1 peer(s)"), "seed count wrong");
+        app.apply_status(status_with_peer_count(3));
+        let out = draw(&app);
+        assert!(out.contains("3 peer(s)"), "updated peer count missing:\n{out}");
+        assert!(!out.contains("1 peer(s)"), "stale peer count still shown:\n{out}");
+    }
+
+    /// An image bubble always paints its metadata caption (🖼 W×H · size · file) as
+    /// the placeholder; the inline thumbnail overlays it only once decoded — and
+    /// with an empty `images` map nothing overlays, so the caption shows through.
+    #[test]
+    fn render_image_bubble_shows_caption_placeholder() {
+        let mut app = test_app();
+        let env = Envelope {
+            v: PROTO_V,
+            msg_id: "img1".into(),
+            typ: MsgType::Image,
+            mime: "image/png".into(),
+            sender: "PEERID".into(),
+            device_name: "peer-box".into(),
+            ts: now_ms(),
+            filename: Some("shot.png".into()),
+            text: None,
+            blob: Some(Blob {
+                hash: "abc123".into(),
+                size: 4096,
+                w: 640,
+                h: 480,
+            }),
+        };
+        app.apply_event(Event::Item {
+            envelope: env,
+            local_path: Some("/tmp/clip-abc123.png".into()),
+        });
+        let out = draw(&app);
+        assert!(out.contains('🖼'), "image caption glyph missing:\n{out}");
+        assert!(out.contains("640×480"), "image dimensions missing:\n{out}");
+        assert!(out.contains("4.0 KB"), "image size missing:\n{out}");
+        // The caption's filename comes from the local blob path, not the advisory name.
+        assert!(out.contains("clip-abc123.png"), "image filename missing:\n{out}");
+    }
 }
