@@ -53,22 +53,19 @@ EOF
   fi
 }
 
-start_remote_daemon(){ # clip/lan: a client daemon in ROOM. echoes the remote pid.
+start_remote_daemon(){ # clip/lan: the remote's DEFAULT daemon in ROOM, so plain `<bin> tui/recv`
   rrun "$BIN" "$ROOM" <<'EOF'
-bin="$1"; room="$2"; cfg="$HOME/.config/cpc/$bin"; mkdir -p "$cfg" "$HOME/.cache"
-if [ -S "$cfg/d.sock" ] && "$HOME/.local/bin/$bin" --socket "$cfg/d.sock" status >/dev/null 2>&1; then
-  echo reused; exit 0
-fi
-setsid nohup "$HOME/.local/bin/$bin" --config-dir "$cfg" --socket "$cfg/d.sock" --room "$room" \
-  daemon --foreground >"$HOME/.cache/cpc-$bin.log" 2>&1 </dev/null &
+bin="$1"; room="$2"; mkdir -p "$HOME/.cache"
+setsid nohup "$HOME/.local/bin/$bin" --room "$room" daemon --foreground \
+  >"$HOME/.cache/cpc-$bin.log" 2>&1 </dev/null &
 echo "$!"
 EOF
 }
 
-remote_ticket(){ # clip: print the remote daemon's pairing ticket
+remote_ticket(){ # clip: print the remote daemon's pairing ticket (default socket)
   rrun "$BIN" "$ROOM" <<'EOF' | sed -n 's/.*"ticket":"\([^"]*\)".*/\1/p'
-bin="$1"; room="$2"; cfg="$HOME/.config/cpc/$bin"
-"$HOME/.local/bin/$bin" --config-dir "$cfg" --socket "$cfg/d.sock" --room "$room" pair --new --json 2>/dev/null
+bin="$1"; room="$2"
+"$HOME/.local/bin/$bin" --room "$room" pair --new --json 2>/dev/null
 EOF
 }
 
@@ -89,14 +86,18 @@ up(){
       local n=0 i=0
       while [ "$i" -lt 12 ]; do n="$("$LB" --room "$ROOM" peers 2>/dev/null | grep -c . || true)"; [ "${n:-0}" -ge 1 ] && break; sleep 1; i=$((i+1)); done
       sleep 1
-      say "connected (${n:-0} peer) - remote & local daemons share room '$ROOM' over mDNS (LAN). Use: $BIN --room $ROOM send ...";;
+      say "connected (${n:-0} peer) - remote & local daemons share room '$ROOM' over mDNS (LAN)."
+      say "  here:      $BIN --room $ROOM send/tui"
+      say "  on $HOST:  lan --room $ROOM recv/tui   (default socket, no --socket needed)";;
     clip)
       say "starting remote clip daemon (room '$ROOM')…"
       local rp; rp="$(start_remote_daemon)"; echo "$rp" >"$STATE/remote.pid"; sleep 1
       say "fetching remote ticket…"; local t; t="$(remote_ticket)"
       [ -n "$t" ] || die "could not obtain remote ticket"
       "$LB" --room "$ROOM" pair "$t" >/dev/null 2>&1 || die "local pair failed"
-      say "connected — paired to remote clip over iroh (direct QUIC). Use: $BIN --room $ROOM send …";;
+      say "connected - paired to remote clip over iroh (direct QUIC)."
+      say "  here:      $BIN --room $ROOM send/tui"
+      say "  on $HOST:  clip --room $ROOM recv/tui   (default socket, no --socket needed)";;
     room)
       say "delegating to native 'room remote' (SSH tunnel)…"
       exec "$(local_bin)" remote "$HOST" --room "$ROOM" --rport "$RPORT" --lport "$LPORT";;
