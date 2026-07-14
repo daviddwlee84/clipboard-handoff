@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# remote.sh — the shared engine behind `<tool> remote <host>`: bootstrap a tool on
+# remote.sh -- the shared engine behind `<tool> remote <host>`: bootstrap a tool on
 # an SSH host (key auth via ~/.ssh/config), start its remote side, and connect the
 # local daemon to it. One place, three tools:
 #
@@ -35,8 +35,8 @@ case "$TOOL" in clip|room|lan) ;; *) echo "usage: remote.sh <clip|room|lan> <hos
 BIN="$TOOL"
 STATE="${XDG_CACHE_HOME:-$HOME/.cache}/cpc/remote/${TOOL}@${HOST}"; mkdir -p "$STATE"
 CTL="$STATE/ssh-ctl.sock"
-say(){ printf '\033[1;36mremote[%s→%s]:\033[0m %s\n' "$TOOL" "$HOST" "$*"; }
-die(){ printf '\033[1;31mremote[%s→%s] error:\033[0m %s\n' "$TOOL" "$HOST" "$*" >&2; exit 1; }
+say(){ printf '\033[1;36mremote[%s->%s]:\033[0m %s\n' "$TOOL" "$HOST" "$*"; }
+die(){ printf '\033[1;31mremote[%s->%s] error:\033[0m %s\n' "$TOOL" "$HOST" "$*" >&2; exit 1; }
 
 # Run a script block on the remote via `bash -s`, passing args safely (no quoting hell).
 rrun(){ ssh -o BatchMode=yes "$HOST" bash -s -- "$@"; }
@@ -47,8 +47,8 @@ test -x "$HOME/.local/bin/$1"
 EOF
   then say "remote binary present (~/.local/bin/$BIN)"
   else
-    say "installing $BIN on $HOST…"
-    [ -n "$INSTALL_SH" ] || die "remote binary missing and no install.sh found — run from the repo, or pre-install with scripts/install.sh $BIN --remote $HOST"
+    say "installing $BIN on $HOST..."
+    [ -n "$INSTALL_SH" ] || die "remote binary missing and no install.sh found -- run from the repo, or pre-install with scripts/install.sh $BIN --remote $HOST"
     "$INSTALL_SH" "$BIN" --remote "$HOST" >&2 || die "remote install failed"
   fi
 }
@@ -90,16 +90,16 @@ up(){
       say "  here:      $BIN --room $ROOM send/tui"
       say "  on $HOST:  lan --room $ROOM recv/tui   (default socket, no --socket needed)";;
     clip)
-      say "starting remote clip daemon (room '$ROOM')…"
+      say "starting remote clip daemon (room '$ROOM')..."
       local rp; rp="$(start_remote_daemon)"; echo "$rp" >"$STATE/remote.pid"; sleep 1
-      say "fetching remote ticket…"; local t; t="$(remote_ticket)"
+      say "fetching remote ticket..."; local t; t="$(remote_ticket)"
       [ -n "$t" ] || die "could not obtain remote ticket"
       "$LB" --room "$ROOM" pair "$t" >/dev/null 2>&1 || die "local pair failed"
       say "connected - paired to remote clip over iroh (direct QUIC)."
       say "  here:      $BIN --room $ROOM send/tui"
       say "  on $HOST:  clip --room $ROOM recv/tui   (default socket, no --socket needed)";;
     room)
-      say "delegating to native 'room remote' (SSH tunnel)…"
+      say "delegating to native 'room remote' (SSH tunnel)..."
       exec "$(local_bin)" remote "$HOST" --room "$ROOM" --rport "$RPORT" --lport "$LPORT";;
   esac
   say "disconnect with: scripts/remote.sh $TOOL $HOST down"
