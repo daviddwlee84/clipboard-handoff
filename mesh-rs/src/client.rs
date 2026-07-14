@@ -108,7 +108,7 @@ pub async fn cmd_send(
             }
         };
         return match resp {
-            Resp::Ok(OkData::Sent { reached, .. }) => {
+            Resp::Ok(OkData::SentImage { reached, .. }) | Resp::Ok(OkData::Sent { reached, .. }) => {
                 if reached == 0 {
                     eprintln!("clip send: warning: no peers connected");
                 }

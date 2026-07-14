@@ -149,6 +149,13 @@ pub enum OkData {
     Status(StatusInfo),
     Peers(Vec<PeerInfo>),
     Config(Option<String>),
+    /// Result of `SendClipboardImage`: the broadcast image's envelope, a locally materialized
+    /// path (so the sender's own TUI can render its thumbnail), and how many peers it reached.
+    SentImage {
+        envelope: Envelope,
+        local_path: Option<String>,
+        reached: usize,
+    },
 }
 
 #[derive(Serialize, serde::Deserialize, Debug, Clone)]

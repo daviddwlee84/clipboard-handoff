@@ -661,23 +661,40 @@ impl Daemon {
         reached
     }
 
-    /// Broadcast PNG bytes as an image item exactly like a `send --image`: content-address the
-    /// blob, announce the envelope, record it as locally-sent (so the TUI can `PasteItem` it back),
-    /// and report reach. Shared by `Req::Send`'s image arm and `Req::SendClipboardImage`.
-    async fn broadcast_image(&self, png: Vec<u8>, w: u32, h: u32, filename: Option<String>) -> OkData {
+    /// Broadcast PNG bytes as an image item and materialize a local copy in the blob cache (same
+    /// as a received image), so the SENDER can render its own thumbnail (TUI) and `PasteItem` it
+    /// back. Returns the envelope, that local path, and the peer reach; callers wrap the pieces
+    /// into the right `OkData`. Shared by `Req::Send`'s image arm and `Req::SendClipboardImage`.
+    async fn broadcast_image(
+        &self,
+        png: Vec<u8>,
+        w: u32,
+        h: u32,
+        filename: Option<String>,
+    ) -> (Envelope, Option<String>, usize) {
         let hash = blake3_hex(&png);
         self.blobs.lock().unwrap().insert(hash.clone(), png.clone());
         let mut env = self.base_envelope(MsgType::Image, "image/png");
         env.filename = filename;
         env.blob = Some(Blob {
-            hash,
+            hash: hash.clone(),
             size: png.len() as u64,
             w,
             h,
         });
+        let local_path = {
+            let path = self.blob_cache_path(&env, &hash);
+            match std::fs::write(&path, &png) {
+                Ok(()) => Some(path.to_string_lossy().to_string()),
+                Err(e) => {
+                    tracing::warn!("materialize sent image failed: {e}");
+                    None
+                }
+            }
+        };
         let n = self.broadcast(&env).await;
-        self.record_sent(&env, None);
-        OkData::Sent { msg_id: env.msg_id, reached: n }
+        self.record_sent(&env, local_path.clone());
+        (env, local_path, n)
     }
 
     // ---- IPC (client <-> daemon) -----------------------------------------
@@ -696,7 +713,8 @@ impl Daemon {
                         Resp::Ok(OkData::Sent { msg_id: env.msg_id, reached: n })
                     }
                     Ok(Sniffed::Image { png, w, h }) => {
-                        Resp::Ok(self.broadcast_image(png, w, h, name).await)
+                        let (env, _local_path, reached) = self.broadcast_image(png, w, h, name).await;
+                        Resp::Ok(OkData::Sent { msg_id: env.msg_id, reached })
                     }
                     Ok(Sniffed::File { bytes, mime }) => {
                         let hash = blake3_hex(&bytes);
@@ -842,7 +860,11 @@ impl Daemon {
                 } else {
                     // arboard is blocking and not Send: read on the blocking pool.
                     match tokio::task::spawn_blocking(clipboard::read_image).await {
-                        Ok(Some((png, w, h))) => Resp::Ok(self.broadcast_image(png, w, h, None).await),
+                        Ok(Some((png, w, h))) => {
+                            let (envelope, local_path, reached) =
+                                self.broadcast_image(png, w, h, None).await;
+                            Resp::Ok(OkData::SentImage { envelope, local_path, reached })
+                        }
                         Ok(None) => Resp::Err {
                             code: 5,
                             message: "no image on the clipboard".into(),

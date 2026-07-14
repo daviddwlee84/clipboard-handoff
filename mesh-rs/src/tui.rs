@@ -306,6 +306,35 @@ impl App {
         }
     }
 
+    /// Append the sender's own bubble for a clipboard image it just broadcast, so there is a
+    /// visible record of the send (mirrors how sent text shows an own bubble). The thumbnail is
+    /// decoded from `local_path` by the IO shell (same pipeline as received images).
+    fn push_sent_image(&mut self, env: Envelope, local_path: Option<String>, reached: usize) {
+        let blob = env.blob.clone().unwrap_or(Blob {
+            hash: String::new(),
+            size: 0,
+            w: 0,
+            h: 0,
+        });
+        self.messages.push(Message {
+            msg_id: env.msg_id,
+            sender: "you".to_string(),
+            mine: true,
+            ts: env.ts,
+            body: Body::Image { blob, local_path },
+            pending: false,
+            note: (reached == 0).then(|| "not delivered (no peers)".to_string()),
+            accept_pending: false,
+            client_seq: None,
+        });
+        self.selected = None;
+        self.follow = true;
+        self.set_toast(format!(
+            "sent clipboard image{}",
+            if reached == 0 { " (no peers)" } else { "" }
+        ));
+    }
+
     // ---- navigation ------------------------------------------------------
 
     fn select_up(&mut self) {
@@ -491,8 +520,9 @@ struct ResizeJob {
 /// Results of the async IPC commands (send/copy/save/open) routed back to the UI loop.
 enum CmdResult {
     Sent { seq: u64, result: Result<(String, usize), String> },
-    /// Result of a Ctrl+V clipboard-image send (no optimistic bubble — just a toast).
-    ClipboardImageSent(Result<(String, usize), String>),
+    /// Result of a Ctrl+V / `--clipboard-image` send: the broadcast image's envelope, a local
+    /// path for the sender's own thumbnail, and the peer reach.
+    ClipboardImageSent(Result<(Envelope, Option<String>, usize), String>),
     Copied { msg_id: String, result: Result<String, String> },
     Saved(Result<String, String>),
     Opened(Result<String, String>),
@@ -674,7 +704,16 @@ async fn event_loop(
                 DaemonMsg::Disconnected => app.set_toast("daemon disconnected".to_string()),
             },
             Some(ie) = img_rx.recv() => apply_img_event(&mut images, ie),
-            Some(cr) = cmd_rx.recv() => apply_cmd_result(&mut app, cr),
+            Some(cr) = cmd_rx.recv() => {
+                // A just-sent clipboard image gets a thumbnail decoded from its local copy, the
+                // same way received images do (apply_cmd_result then appends the own bubble).
+                if let CmdResult::ClipboardImageSent(Ok((env, local_path, _))) = &cr {
+                    if env.typ == MsgType::Image {
+                        dispatch_decode(&mut images, &picker, &img_tx, env.msg_id.clone(), local_path.clone());
+                    }
+                }
+                apply_cmd_result(&mut app, cr);
+            }
             _ = status_poll.tick() => spawn_status(paths, &cmd_tx),
             _ = tick.tick() => { app.expire_toast(); }
         }
@@ -699,11 +738,10 @@ fn apply_img_event(images: &mut HashMap<String, ImgState>, ie: ImgEvent) {
 fn apply_cmd_result(app: &mut App, cr: CmdResult) {
     match cr {
         CmdResult::Sent { seq, result } => app.on_sent_result(seq, result),
-        CmdResult::ClipboardImageSent(Ok((_msg_id, reached))) => {
-            let note = if reached == 0 { " (no peers)" } else { "" };
-            app.set_toast(format!("sent clipboard image{note}"));
+        CmdResult::ClipboardImageSent(Ok((env, local_path, reached))) => {
+            app.push_sent_image(env, local_path, reached);
         }
-        CmdResult::ClipboardImageSent(Err(e)) => app.set_toast(e),
+        CmdResult::ClipboardImageSent(Err(e)) => app.set_toast(format!("clipboard image: {e}")),
         CmdResult::Copied { msg_id, result } => match result {
             Ok(desc) => {
                 app.mark_copied(&msg_id);
@@ -755,7 +793,9 @@ fn spawn_send_clipboard_image(paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdR
     tokio::spawn(async move {
         let res = request(&paths, Req::SendClipboardImage).await;
         let out = match res {
-            Ok(Resp::Ok(OkData::Sent { msg_id, reached })) => Ok((msg_id, reached)),
+            Ok(Resp::Ok(OkData::SentImage { envelope, local_path, reached })) => {
+                Ok((envelope, local_path, reached))
+            }
             Ok(Resp::Err { message, .. }) => Err(message),
             Ok(_) => Err("unexpected send response".to_string()),
             Err(e) => Err(e.to_string()),
@@ -1505,6 +1545,66 @@ mod tests {
             }
             _ => panic!("expected an image bubble"),
         }
+    }
+
+    #[test]
+    fn sending_a_clipboard_image_appends_an_own_bubble() {
+        let mut app = test_app();
+        let env = Envelope {
+            v: PROTO_V,
+            msg_id: "sent-img".into(),
+            typ: MsgType::Image,
+            mime: "image/png".into(),
+            sender: app.header.my_id.clone(),
+            device_name: String::new(),
+            ts: now_ms(),
+            filename: None,
+            text: None,
+            blob: Some(Blob {
+                hash: "deadbeef".into(),
+                size: 2048,
+                w: 320,
+                h: 200,
+            }),
+        };
+        // Delivered to a peer: an own image bubble with the thumbnail's local path, no note.
+        app.push_sent_image(env, Some("/tmp/clip-deadbeef.png".into()), 1);
+        assert_eq!(app.messages.len(), 1);
+        let m = &app.messages[0];
+        assert!(m.mine, "sent image must be an own bubble");
+        assert!(!m.pending);
+        assert!(m.note.is_none(), "delivered => no note");
+        match &m.body {
+            Body::Image { blob, local_path } => {
+                assert_eq!((blob.w, blob.h), (320, 200));
+                assert_eq!(local_path.as_deref(), Some("/tmp/clip-deadbeef.png"));
+            }
+            _ => panic!("expected an image bubble"),
+        }
+        // Sending it a peer-less session self does not count as "received this session".
+        assert!(!app.received_any, "own send must not arm the clear-on-quit prompt");
+    }
+
+    #[test]
+    fn sending_a_clipboard_image_with_no_peers_notes_undelivered() {
+        let mut app = test_app();
+        let env = Envelope {
+            v: PROTO_V,
+            msg_id: "sent-img-0".into(),
+            typ: MsgType::Image,
+            mime: "image/png".into(),
+            sender: app.header.my_id.clone(),
+            device_name: String::new(),
+            ts: now_ms(),
+            filename: None,
+            text: None,
+            blob: Some(Blob { hash: "beef".into(), size: 1, w: 1, h: 1 }),
+        };
+        app.push_sent_image(env, None, 0);
+        assert_eq!(
+            app.messages[0].note.as_deref(),
+            Some("not delivered (no peers)")
+        );
     }
 
     #[test]
