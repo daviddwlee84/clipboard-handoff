@@ -47,7 +47,7 @@ test -x "$HOME/.local/bin/$1"
 EOF
   then say "remote binary present (~/.local/bin/$BIN)"
   else
-    say "installing $BIN on $HOST..."
+    say "installing $BIN on ${HOST}..."
     [ -n "$INSTALL_SH" ] || die "remote binary missing and no install.sh found -- run from the repo, or pre-install with scripts/install.sh $BIN --remote $HOST"
     "$INSTALL_SH" "$BIN" --remote "$HOST" >&2 || die "remote install failed"
   fi

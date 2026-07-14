@@ -16,7 +16,25 @@
 #   scripts/install.sh room --remote local_ubuntu
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Locate the repo source tree (holds mesh-rs/, room-go/, experiments/). When run
+# directly as scripts/install.sh it is one dir up; but when this file has been
+# copied into ~/.local/libexec/cpc so `<tool> remote <host>` can call it, the
+# sources are NOT beside it — fall back to $CPC_ROOT, else search upward from the
+# current directory (so `<tool> remote` works when invoked from a repo checkout).
+find_root(){
+  local d
+  d="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" || d=""
+  if [ -n "$d" ] && [ -d "$d/mesh-rs" ]; then printf '%s\n' "$d"; return 0; fi
+  if [ -n "${CPC_ROOT:-}" ] && [ -d "$CPC_ROOT/mesh-rs" ]; then printf '%s\n' "$CPC_ROOT"; return 0; fi
+  d="$PWD"
+  while [ -n "$d" ]; do
+    if [ -d "$d/mesh-rs" ] && [ -d "$d/experiments" ]; then printf '%s\n' "$d"; return 0; fi
+    if [ "$d" = "/" ]; then break; fi
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+ROOT="$(find_root || true)"
 PREFIX=""            # empty => default to <target>/.local/bin (local or remote HOME)
 REMOTE=""
 TOOLS=()
@@ -24,6 +42,7 @@ TOOLS=()
 say(){ printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn(){ printf '\033[1;33mwarn:\033[0m %s\n' "$*" >&2; }
 die(){ printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+[ -n "$ROOT" ] || die "cannot find the cross-platform-copy source tree — run '<tool> remote' from a repo checkout, or set CPC_ROOT=/path/to/repo"
 
 while [ $# -gt 0 ]; do
   case "$1" in
