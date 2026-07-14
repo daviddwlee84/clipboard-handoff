@@ -879,9 +879,12 @@ fn do_save(app: &mut App, _paths: &Paths, cmd_tx: &mpsc::UnboundedSender<CmdResu
     tokio::spawn(async move {
         let dest_str = dest.display().to_string();
         let res = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             std::fs::copy(&src, &dest)
                 .map(|_| dest.display().to_string())
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("{e} (src {src})"))
         })
         .await
         .unwrap_or_else(|_| Err(format!("save task panicked ({dest_str})")));
@@ -959,6 +962,7 @@ struct BlockInfo {
     start: usize,
     height: usize,
     img: Option<String>, // msg_id of an image whose thumbnail overlays this block
+    mine: bool,          // own bubble → caption + thumbnail hug the right edge
 }
 
 fn ui(
@@ -1054,10 +1058,17 @@ fn render_messages(
         if rel + IMG_ROWS > viewport {
             continue;
         }
+        let width = inner.width.min(IMG_MAX_COLS);
+        // Own images hug the right edge (like own text/captions); peers' hug the left.
+        let x = if b.mine {
+            inner.x + inner.width.saturating_sub(width)
+        } else {
+            inner.x
+        };
         let rect = Rect {
-            x: inner.x,
+            x,
             y: inner.y + rel as u16,
-            width: inner.width.min(IMG_MAX_COLS),
+            width,
             height: IMG_ROWS as u16,
         };
         render_thumbnail(f, images, msg_id, rect, resize_tx);
@@ -1164,7 +1175,11 @@ fn build_lines(app: &App, width: usize, now: u64) -> (Vec<Line<'static>>, Vec<Bl
                     human_size(blob.size),
                     file
                 );
-                lines.push(Line::from(Span::raw(caption).magenta()));
+                let mut cap = Line::from(Span::raw(caption).magenta());
+                if m.mine {
+                    cap = cap.right_aligned();
+                }
+                lines.push(cap);
                 for _ in 0..IMG_ROWS {
                     lines.push(Line::from(Span::raw(String::new())));
                 }
@@ -1197,7 +1212,7 @@ fn build_lines(app: &App, width: usize, now: u64) -> (Vec<Line<'static>>, Vec<Bl
             }
         }
         let height = lines.len() - start;
-        blocks.push(BlockInfo { start, height, img });
+        blocks.push(BlockInfo { start, height, img, mine: m.mine });
     }
 
     let total = lines.len();
@@ -1924,5 +1939,51 @@ mod tests {
         assert!(out.contains("4.0 KB"), "image size missing:\n{out}");
         // The caption's filename comes from the local blob path, not the advisory name.
         assert!(out.contains("clip-abc123.png"), "image filename missing:\n{out}");
+    }
+
+    /// A peer's image caption hugs the left edge; the sender's own image caption is
+    /// right-aligned (mirroring how own text/file lines align), so sends read on the right.
+    #[test]
+    fn own_image_caption_is_right_aligned_peer_is_left() {
+        let img_env = |sender: &str, w: u32, h: u32, hash: &str| Envelope {
+            v: PROTO_V,
+            msg_id: format!("id-{hash}"),
+            typ: MsgType::Image,
+            mime: "image/png".into(),
+            sender: sender.into(),
+            device_name: String::new(),
+            ts: now_ms(),
+            filename: None,
+            text: None,
+            blob: Some(Blob { hash: hash.into(), size: 4096, w, h }),
+        };
+        let mut app = test_app();
+        // Peer image (left) — distinctive dimensions to find its caption line.
+        app.apply_event(Event::Item {
+            envelope: img_env("PEERID", 640, 480, "peerhash"),
+            local_path: Some("/tmp/peer.png".into()),
+        });
+        // Own sent image (should be right-aligned).
+        let mine = img_env(&app.header.my_id.clone(), 320, 200, "minehash");
+        app.push_sent_image(mine, Some("/tmp/mine.png".into()), 1);
+
+        // Render tall enough that both image bubbles are fully visible (not scrolled off).
+        let mut images: HashMap<String, ImgState> = HashMap::new();
+        let (resize_tx, _rx) = mpsc::unbounded_channel::<ResizeJob>();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).expect("test terminal");
+        term.draw(|f| ui(f, &app, &mut images, &resize_tx)).expect("draw");
+        let out = rendered(&term);
+        let peer_line = out.lines().find(|l| l.contains("640×480")).expect("peer caption line");
+        let own_line = out.lines().find(|l| l.contains("320×200")).expect("own caption line");
+        // Column where each caption's text starts (rows begin with the chat border, so a
+        // leading-space count won't do). The peer caption hugs the left; the own one is padded
+        // far to the right by right-alignment.
+        let peer_col = peer_line.find("640×480").unwrap();
+        let own_col = own_line.find("320×200").unwrap();
+        assert!(peer_col < 15, "peer caption should hug the left (col {peer_col}): {peer_line:?}");
+        assert!(
+            own_col > peer_col + 40,
+            "own caption should be right-aligned (own col {own_col}, peer col {peer_col}):\n{own_line:?}",
+        );
     }
 }
