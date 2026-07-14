@@ -59,7 +59,26 @@ fn spawn_daemon(paths: &Paths) -> Result<()> {
 pub(crate) async fn request(paths: &Paths, req: Req) -> Result<Resp> {
     let mut s = connect_or_spawn(paths).await?;
     write_frame(&mut s, &req).await?;
-    read_frame(&mut s).await
+    match read_frame(&mut s).await {
+        Ok(resp) => Ok(resp),
+        // A dropped connection mid-reply (io UnexpectedEof, which renders as "early eof") almost
+        // always means the resident daemon is an OLDER build that can't deserialize this request
+        // and closed the socket. Turn the cryptic "early eof" into an actionable hint.
+        Err(e) if is_unexpected_eof(&e) => Err(anyhow::anyhow!(
+            "the daemon closed the connection without replying — the resident daemon is likely an \
+             older build that can't understand this request. Run `clip daemon stop` (it respawns \
+             from the current binary), then retry."
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// True if the error chain carries an `io::ErrorKind::UnexpectedEof` (rendered as "early eof").
+fn is_unexpected_eof(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -75,8 +94,33 @@ pub async fn cmd_send(
     image: bool,
     file: bool,
     _auto: bool,
+    clipboard_image: bool,
     name: Option<String>,
 ) -> Result<i32> {
+    // `--clipboard-image`: the daemon (the arboard owner) reads the OS clipboard image and
+    // broadcasts it — the CLI twin of the TUI's Ctrl+V. No PATH/stdin is read.
+    if clipboard_image {
+        let resp = match request(paths, Req::SendClipboardImage).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("clip send: cannot reach daemon: {e:#}");
+                return Ok(3);
+            }
+        };
+        return match resp {
+            Resp::Ok(OkData::Sent { reached, .. }) => {
+                if reached == 0 {
+                    eprintln!("clip send: warning: no peers connected");
+                }
+                Ok(0)
+            }
+            Resp::Err { code, message } => {
+                eprintln!("clip send: {message}");
+                Ok(code)
+            }
+            _ => Ok(0),
+        };
+    }
     let kind = if text {
         SniffKind::Text
     } else if image {

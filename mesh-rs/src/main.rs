@@ -62,6 +62,9 @@ enum Cmd {
         file: bool,
         #[arg(long)]
         auto: bool,
+        /// Send the image currently on the OS clipboard — no PATH/stdin (same as the TUI's Ctrl+V).
+        #[arg(long = "clipboard-image")]
+        clipboard_image: bool,
         /// Advisory filename carried with an image/file item (defaults to PATH's base name).
         #[arg(long)]
         name: Option<String>,
@@ -169,8 +172,9 @@ async fn dispatch(cli: Cli, paths: config::Paths) -> Result<i32> {
             image,
             file,
             auto,
+            clipboard_image,
             name,
-        } => client::cmd_send(&paths, path, text, image, file, auto, name).await,
+        } => client::cmd_send(&paths, path, text, image, file, auto, clipboard_image, name).await,
         Cmd::Clear { all, yes } => client::cmd_clear(&paths, all, yes).await,
         Cmd::Recv {
             follow,
