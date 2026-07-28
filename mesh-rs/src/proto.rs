@@ -389,10 +389,9 @@ impl Dedup {
         self.last_written = Some(hash.to_string());
     }
 
-    /// Is `hash` equal to the last value we wrote to our own clipboard?
-    /// (Used to ignore a local clipboard change that we caused ourselves — wired up
-    /// once `broadcast_on_copy` clipboard-watching lands in Phase 1; unit-tested now.)
-    #[allow(dead_code)]
+    /// Is `hash` equal to the last value we wrote to our own clipboard? Used by the
+    /// `broadcast_on_copy` watcher to ignore a local clipboard change we caused ourselves
+    /// (auto_copy of a received item), so it is never re-broadcast.
     pub fn is_echo(&self, hash: &str) -> bool {
         self.last_written.as_deref() == Some(hash)
     }

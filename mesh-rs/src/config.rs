@@ -130,6 +130,9 @@ impl ConfigStore {
         if key == "auto_copy" && !matches!(value, "notify" | "on" | "off") {
             anyhow::bail!("auto_copy must be one of: notify|on|off");
         }
+        if key == "broadcast_on_copy" && !matches!(value, "on" | "off") {
+            anyhow::bail!("broadcast_on_copy must be one of: on|off");
+        }
         self.map.insert(key.to_string(), value.to_string());
         let s = serde_json::to_string_pretty(&self.map)?;
         std::fs::write(&self.path, s).with_context(|| format!("write {}", self.path.display()))?;
@@ -138,6 +141,11 @@ impl ConfigStore {
 
     pub fn auto_copy(&self) -> String {
         self.get("auto_copy").unwrap_or_else(|| "notify".into())
+    }
+    /// Clipboard-watch send mode (opt-in): when `on`, the daemon auto-broadcasts local clipboard
+    /// changes to peers. Off by default.
+    pub fn broadcast_on_copy(&self) -> String {
+        self.get("broadcast_on_copy").unwrap_or_else(|| "off".into())
     }
     /// Folder sink (SPEC §3): received image/file items land here. "" = disabled.
     pub fn save_dir(&self) -> String {

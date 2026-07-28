@@ -74,6 +74,12 @@ pub struct Daemon {
     /// The clear scope a `daemon stop` client already resolved+applied (so the shutdown path
     /// doesn't re-derive one from `clear_on_exit`). `None` on SIGTERM.
     stop_scope: Mutex<Option<String>>,
+    /// `broadcast_on_copy` watcher state: the signature of the last clipboard content it processed
+    /// (so only genuine changes broadcast), and when the daemon itself last wrote the clipboard
+    /// (auto-copy/paste) — a change within a short grace window after that is our own echo, not a
+    /// user copy, so it is never re-broadcast (loop guard).
+    clip_watch_seen: Mutex<Option<String>>,
+    clip_written_at: Mutex<Option<std::time::Instant>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +386,8 @@ pub async fn run(paths: Paths) -> Result<()> {
         session: Mutex::new(session),
         stop: Arc::new(tokio::sync::Notify::new()),
         stop_scope: Mutex::new(None),
+        clip_watch_seen: Mutex::new(None),
+        clip_written_at: Mutex::new(None),
     });
 
     // Accept loop for inbound iroh connections (same-room ALPN only).
@@ -415,6 +423,14 @@ pub async fn run(paths: Paths) -> Result<()> {
         paths.room,
         paths.socket.display()
     );
+
+    // broadcast_on_copy (opt-in): watch the local OS clipboard and auto-broadcast genuine changes,
+    // so a copy/screenshot fans out to peers with no explicit `send`/Ctrl+V. Only meaningful with a
+    // real clipboard; loop-safe against auto_copy on the other side (see run_clipboard_watch).
+    if clipboard_available {
+        let d = daemon.clone();
+        tokio::spawn(async move { d.run_clipboard_watch().await });
+    }
 
     // SIGTERM is a session end (SPEC §8): apply `clear_on_exit` non-interactively (a bare daemon
     // has no TTY, so `ask` falls back to transient) and shut down cleanly.
@@ -695,6 +711,81 @@ impl Daemon {
         let n = self.broadcast(&env).await;
         self.record_sent(&env, local_path.clone());
         (env, local_path, n)
+    }
+
+    /// Broadcast a text item (used by `broadcast_on_copy`); returns peer reach.
+    async fn broadcast_text(&self, text: String) -> usize {
+        let mut env = self.base_envelope(MsgType::Text, "text/plain; charset=utf-8");
+        env.text = Some(text);
+        let n = self.broadcast(&env).await;
+        self.record_sent(&env, None);
+        n
+    }
+
+    /// True if the daemon wrote the OS clipboard itself within `grace` (auto_copy / paste), i.e. a
+    /// clipboard change observed now is our own echo rather than a fresh user copy.
+    fn wrote_clipboard_within(&self, grace: std::time::Duration) -> bool {
+        self.clip_written_at
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed() < grace)
+            .unwrap_or(false)
+    }
+
+    /// `broadcast_on_copy` watcher: poll the OS clipboard and, when the mode is `on`, broadcast a
+    /// genuine local change to peers (image → PNG, text → text). Loop-safe: content the daemon
+    /// itself just put on the clipboard (auto_copy of a received item) is recognised as an echo —
+    /// by exact hash for text, and by a short post-write grace window for images (whose PNG↔RGBA
+    /// round-trip is not hash-stable) — and never re-broadcast. Enabling the mode does not broadcast
+    /// the pre-existing clipboard; only changes made afterward go out.
+    async fn run_clipboard_watch(self: Arc<Self>) {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(700);
+        const ECHO_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+        loop {
+            tokio::select! {
+                _ = self.stop.notified() => break,
+                _ = tokio::time::sleep(POLL) => {}
+            }
+            if self.config.lock().unwrap().broadcast_on_copy() != "on" {
+                // Disabled: drop the baseline so re-enabling doesn't blast the current clipboard.
+                *self.clip_watch_seen.lock().unwrap() = None;
+                continue;
+            }
+            let snap = match tokio::task::spawn_blocking(clipboard::read_snapshot).await {
+                Ok(Some(s)) => s,
+                _ => continue, // empty clipboard / read failed
+            };
+            let sig = match &snap {
+                clipboard::Snapshot::Text(t) => blake3_hex(t.as_bytes()),
+                clipboard::Snapshot::Image { rgba, .. } => blake3_hex(rgba),
+            };
+            // Only broadcast a genuine change from an established baseline (so turning the mode on
+            // doesn't broadcast whatever already sat on the clipboard).
+            match self.clip_watch_seen.lock().unwrap().replace(sig.clone()) {
+                Some(prev) if prev == sig => continue, // unchanged
+                None => continue,                      // first observation → baseline only
+                Some(_) => {}                          // genuine change
+            }
+            // Loop guard: skip content we ourselves placed on the clipboard.
+            if self.dedup.lock().unwrap().is_echo(&sig) || self.wrote_clipboard_within(ECHO_GRACE) {
+                continue;
+            }
+            match snap {
+                clipboard::Snapshot::Text(t) => {
+                    let n = self.broadcast_text(t).await;
+                    tracing::info!("broadcast_on_copy: text → {n} peer(s)");
+                }
+                clipboard::Snapshot::Image { rgba, w, h } => {
+                    match clipboard::rgba_to_png(&rgba, w, h) {
+                        Some(png) => {
+                            let (_env, _lp, n) = self.broadcast_image(png, w, h, None).await;
+                            tracing::info!("broadcast_on_copy: image {w}×{h} → {n} peer(s)");
+                        }
+                        None => tracing::warn!("broadcast_on_copy: could not encode clipboard image"),
+                    }
+                }
+            }
+        }
     }
 
     // ---- IPC (client <-> daemon) -----------------------------------------
@@ -1087,6 +1178,9 @@ impl Daemon {
 
         // Record what we wrote so echo-suppression (`on` mode) doesn't re-broadcast it.
         self.dedup.lock().unwrap().note_written(&hash);
+        // …and when, so the broadcast_on_copy watcher treats the resulting clipboard change as our
+        // own echo (robust for images, whose PNG↔RGBA round-trip is not hash-stable).
+        *self.clip_written_at.lock().unwrap() = Some(std::time::Instant::now());
         Ok(())
     }
 

@@ -25,6 +25,9 @@ you already run a server. `lan` is a bake-off experiment, not a shipping target.
 - **[implementation.md](implementation.md)** — how it's actually built: the shared daemon/IPC/envelope
   architecture, per-impl internals (mesh-rs, room-go, lan-go, parked libp2p-mesh), the cross-transport
   comparison tables, and the cross-machine / `remote` plumbing. Deeper than the usage guides.
+- **[alternatives.md](alternatives.md)** — prior art & alternatives: the `ccimg` / `sshimg.nvim`
+  projects that inspired this (and how they work), how we differ, and the wider ecosystem
+  (OSC 52, kitty OSC 5522, AirDrop, Syncthing, Taildrop, LocalSend, magic-wormhole, …).
 
 **Per-tool usage guides** (install, connect, full command reference, sinks, sessions, TUI keys,
 troubleshooting):

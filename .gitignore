@@ -30,3 +30,8 @@ hostkey.pub
 .idea/
 .vscode/
 .specstory/
+
+# ---- personal agent-skill tooling (not part of the project) ----
+.agents/
+.claude/skills/
+skills-lock.json

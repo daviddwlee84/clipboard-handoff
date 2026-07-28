@@ -64,6 +64,24 @@ remote tool host action="up":
       scripts/remote.sh {{tool}} {{host}} {{action}}
     fi
 
+# Two-way clipboard sync with an SSH host: pair, then enable send+receive on both ends. The *send*
+# half (broadcast_on_copy) needs the current `clip` build on both ends; this machine has it, but the
+# remote's send side needs it rebuilt (`just install-remote <host> clip` once, then re-run this).
+# The remote's *receive* half (auto_copy) works on any build, so here→remote works immediately.
+# Pair + enable two-way clipboard sync (copy/screenshot on either side, paste on the other): `just clipsync ts_mac`.
+clipsync host=remote room="default":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "==> pairing with {{host}} (room {{room}}) over iroh…"
+    scripts/remote.sh clip "{{host}}" up --room "{{room}}"
+    echo "==> enabling clipboard sync (broadcast_on_copy + auto_copy) here and on {{host}}…"
+    clip config set broadcast_on_copy on
+    clip config set auto_copy on
+    ssh -o BatchMode=yes "{{host}}" '~/.local/bin/clip config set broadcast_on_copy on && ~/.local/bin/clip config set auto_copy on'
+    echo "OK: clipboard sync ready with {{host}} -- copy/screenshot on either side, paste on the other."
+    echo "    turn off:  clip config set broadcast_on_copy off   (repeat on {{host}})"
+    echo "    unpair:    just remote clip {{host}} down"
+
 # TUI PTY end-to-end (gated; launches the real binary under a pseudo-terminal): `just tui-e2e mesh-rs`
 tui-e2e impl:
     #!/usr/bin/env bash

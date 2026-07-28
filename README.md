@@ -19,6 +19,17 @@ could compare which architecture is actually nicest to use. Three are now usable
 All obey one contract: [`docs/SPEC.md`](docs/SPEC.md) (CLI, sinks, sessions), [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
 (wire envelope), [`docs/BAKEOFF.md`](docs/BAKEOFF.md) (scorecard + measurements).
 
+## Prior art
+
+This started from Alexander Zeitler's work on pasting clipboard images into Claude Code over SSH —
+[the article](https://alexanderzeitler.com/articles/paste-clipboard-images-into-claude-code-over-ssh/),
+[`claude-ssh-image-skill`](https://github.com/AlexZeitler/claude-ssh-image-skill), and
+[`sshimg.nvim`](https://github.com/AlexZeitler/sshimg.nvim). They solve the local→remote image case with
+a local daemon + an SSH reverse tunnel, and they're the reason this project uses a resident agent at all.
+[`docs/alternatives.md`](docs/alternatives.md) credits them properly, explains their data path, how we
+differ (any→any, N devices, text/images/files, landing on the receiving clipboard), and surveys the wider
+ecosystem.
+
 ## What works (all three, verified)
 
 - **CLI hand-off** — pipe or pass a path; text / images / **arbitrary files**.

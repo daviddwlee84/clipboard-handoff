@@ -86,6 +86,45 @@ pub fn write(payload: Payload) -> Result<()> {
     Ok(())
 }
 
+/// A snapshot of the OS clipboard for the `broadcast_on_copy` watcher: raw image pixels (hashed
+/// cheaply for change-detection; PNG-encoded only when actually broadcast) or text.
+pub enum Snapshot {
+    Image { rgba: Vec<u8>, w: u32, h: u32 },
+    Text(String),
+}
+
+/// Read the current clipboard as a `Snapshot` (image preferred over text). `None` on an empty
+/// clipboard, a headless/forced host, or any read failure (never panics). Blocking + arboard's
+/// `Clipboard` isn't `Send`, so run inside `spawn_blocking` at the call site.
+pub fn read_snapshot() -> Option<Snapshot> {
+    if force_headless() {
+        return None;
+    }
+    let mut cb = arboard::Clipboard::new().ok()?;
+    if let Ok(img) = cb.get_image() {
+        return Some(Snapshot::Image {
+            rgba: img.bytes.into_owned(),
+            w: img.width as u32,
+            h: img.height as u32,
+        });
+    }
+    match cb.get_text() {
+        Ok(t) if !t.is_empty() => Some(Snapshot::Text(t)),
+        _ => None,
+    }
+}
+
+/// Encode raw RGBA pixels to PNG bytes (to broadcast a watched clipboard image). `None` on a
+/// dimension/encode mismatch.
+pub fn rgba_to_png(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(w, h, rgba.to_vec())?;
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(png)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
