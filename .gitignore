@@ -35,3 +35,6 @@ hostkey.pub
 .agents/
 .claude/skills/
 skills-lock.json
+
+# mkdocs build output (regenerated every build)
+/site/

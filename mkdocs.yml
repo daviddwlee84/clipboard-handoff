@@ -1,0 +1,93 @@
+site_name: clipboard-handoff
+site_description: Documentation for clipboard-handoff
+site_url: https://daviddwlee84.github.io/clipboard-handoff/
+repo_url: https://github.com/daviddwlee84/clipboard-handoff
+repo_name: daviddwlee84/clipboard-handoff
+edit_uri: edit/main/docs/
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  language: en
+plugins:
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: true
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          name: English
+          default: true
+        - locale: zh-TW
+          name: 繁體中文 (zh-TW)
+  - search
+  - copy-to-llm:
+      repo_url: "https://daviddwlee84.github.io/clipboard-handoff/"
+      button_hover_color: "var(--md-primary-fg-color)"
+      toast_bg_color: "var(--md-primary-fg-color)"
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - tables
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path:
+        - .
+        - docs
+        - docs/_snippets
+      check_paths: true
+  - pymdownx.tabbed:
+      alternate_style: true
+nav:
+  - Home: README.md
+  - Usage:
+      - "clip — mesh-rs (Rust/iroh P2P)": usage-mesh-rs.md
+      - "room — room-go (Go/wish SSH room)": usage-room-go.md
+      - "lan — lan-go (Go/quic+mDNS)": usage-lan-go.md
+  - The contract:
+      - SPEC: SPEC.md
+      - PROTOCOL: PROTOCOL.md
+  - Deep dives:
+      - Implementation: implementation.md
+      - Bake-off results: BAKEOFF.md
+      - Prior art & alternatives: alternatives.md
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/daviddwlee84/clipboard-handoff
+# `_snippets/` are meant to be included via pymdownx.snippets, never
+# rendered as their own page. `not_in_nav` suppresses the INFO warning.
+not_in_nav: |
+  /_snippets/

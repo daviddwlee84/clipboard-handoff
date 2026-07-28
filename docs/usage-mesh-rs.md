@@ -5,9 +5,9 @@ directly (mDNS on a LAN, or a copy-pasted *ticket* across networks) over an iroh
 no relay, no account, no infrastructure. Text and images copied on one device become
 receivable/pasteable on the other, the image arriving **BLAKE3 hash-equal**.
 
-- Binary: **`clip`** · transport: **iroh** (Ed25519 NodeId identity) · impl: [`../mesh-rs/`](../mesh-rs/)
+- Binary: **`clip`** · transport: **iroh** (Ed25519 NodeId identity) · impl: [`../mesh-rs/`](https://github.com/daviddwlee84/clipboard-handoff/tree/main/mesh-rs/)
 - Shared contract: [SPEC](SPEC.md) (CLI §2, sinks §3, config §5, sessions §8) · wire/IPC: [PROTOCOL](PROTOCOL.md)
-- For deeper transport notes see [`../mesh-rs/README.md`](../mesh-rs/README.md).
+- For deeper transport notes see [`../mesh-rs/README.md`](https://github.com/daviddwlee84/clipboard-handoff/blob/main/mesh-rs/README.md).
 
 ## Install / build
 

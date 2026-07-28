@@ -11,9 +11,9 @@ hand-rolled LAN mesh good enough?"* — see [BAKEOFF](BAKEOFF.md).
 > in `shared-go`, so `lan` and `libp2p-mesh` behave identically.
 
 - Binary: **`lan`** · transport: **quic-go + mDNS** (`grandcat/zeroconf`); identity = SHA-256 of a
-  persisted self-signed TLS cert (Syncthing-style) · impl: [`../experiments/lan-go/`](../experiments/lan-go/)
+  persisted self-signed TLS cert (Syncthing-style) · impl: [`../experiments/lan-go/`](https://github.com/daviddwlee84/clipboard-handoff/tree/main/experiments/lan-go/)
 - Shared contract: [SPEC](SPEC.md) (CLI §2, sinks §3, config §5, sessions §8) · wire/IPC: [PROTOCOL](PROTOCOL.md)
-- More detail: [`../experiments/README.md`](../experiments/README.md), [`../experiments/lan-go/README.md`](../experiments/lan-go/README.md).
+- More detail: [`../experiments/README.md`](https://github.com/daviddwlee84/clipboard-handoff/blob/main/experiments/README.md), [`../experiments/lan-go/README.md`](https://github.com/daviddwlee84/clipboard-handoff/blob/main/experiments/lan-go/README.md).
 
 ## Install / build
 

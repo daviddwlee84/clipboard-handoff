@@ -6,9 +6,9 @@ same room. The trade for running a server: a natural path to retained history an
 client tier. The server sees plaintext (no client-side E2E in Phase 0).
 
 - Binary: **`room`** · transport: **SSH/wish relay** (SSH public-key fingerprint = identity) ·
-  impl: [`../room-go/`](../room-go/)
+  impl: [`../room-go/`](https://github.com/daviddwlee84/clipboard-handoff/tree/main/room-go/)
 - Shared contract: [SPEC](SPEC.md) (CLI §2, sinks §3, config §5, sessions §8) · wire/IPC: [PROTOCOL](PROTOCOL.md)
-- For deeper server/harness notes see [`../room-go/README.md`](../room-go/README.md).
+- For deeper server/harness notes see [`../room-go/README.md`](https://github.com/daviddwlee84/clipboard-handoff/blob/main/room-go/README.md).
 
 ## Install / build
 
@@ -69,7 +69,7 @@ $BIN "${B[@]}" paste                      # (auto_copy notify) place it on B's c
 
 > **One-command SSH tunnel — `room remote <host>`.** A sibling change adds a `room remote <host>`
 > convenience that connects through an SSH tunnel in one step. It is not documented here to avoid
-> going stale — see [`../room-go/README.md`](../room-go/README.md) for its current flags and behavior.
+> going stale — see [`../room-go/README.md`](https://github.com/daviddwlee84/clipboard-handoff/blob/main/room-go/README.md) for its current flags and behavior.
 
 ## Command reference
 
