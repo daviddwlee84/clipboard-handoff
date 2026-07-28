@@ -206,5 +206,4 @@ daemon with `CLIP_FORCE_HEADLESS=1`.
 - **Nothing to paste/recv** → exit code `5`; you haven't received an item yet.
 - **Trust note (Phase 0):** any peer you pair/auto-connect with is auto-allowlisted. TOFU
   hold-for-approval and the SPEC's short-code/QR confirm are Phase 1 (not in this build).
-</content>
 </invoke>

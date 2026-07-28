@@ -108,8 +108,8 @@ Windows `%APPDATA%\lan\`. Override with `--config-dir`.
 
 ## Sessions & clearing (SPEC §8)
 
-A session is one daemon run; it tracks the transient store (blob cache + `recv --emit-path` temp files
-+ in-memory buffer), the `text_file` size at session start, and the `save_dir` files it wrote.
+A session is one daemon run; it tracks the transient store (blob cache + `recv --emit-path` temp files +
+in-memory buffer), the `text_file` size at session start, and the `save_dir` files it wrote.
 
 ```sh
 lan clear                # transient only
@@ -156,4 +156,3 @@ paste); and history starts empty (only items received while the TUI is open are 
 - **Nothing to paste/recv** → exit code `5`. **No daemon** → exit code `3`.
 - Headless hosts: the clipboard degrades gracefully (`status` shows `clipboard: unavailable`);
   `send`/`recv`/`save_dir` still work.
-</content>

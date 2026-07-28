@@ -197,4 +197,3 @@ On a display-less client the clipboard degrades gracefully (`status` shows `clip
 - **No daemon** → exit code `3`; a client couldn't reach/spawn the daemon.
 - **Phase 0 trust caveats:** the server trusts any key and the host key is trusted on connect
   (`InsecureIgnoreHostKey`); sender allowlist/TOFU is Phase 1. Fine for loopback/LAN.
-</content>

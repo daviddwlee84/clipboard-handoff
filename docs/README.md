@@ -40,4 +40,3 @@ troubleshooting):
 
 The usage guides cross-link to SPEC/PROTOCOL rather than restating the full contract. Repo-level
 overview lives in the [root README](https://github.com/daviddwlee84/clipboard-handoff/blob/main/README.md).
-</content>
