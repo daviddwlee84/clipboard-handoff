@@ -29,7 +29,7 @@ hostkey.pub
 *.swp
 .idea/
 .vscode/
-.specstory/
+# .specstory/
 
 # ---- personal agent-skill tooling (not part of the project) ----
 .agents/
