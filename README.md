@@ -101,3 +101,14 @@ mesh-rs/scripts/autodiscover.sh    # two daemons connect with no ticket
 LAN-first by design. **Not yet:** the internet/relay path (a config flag away for `mesh-rs`), Windows, Linux
 **desktop** clipboard validation (the test box is headless), and packaging/signing. See
 [`docs/BAKEOFF.md`](docs/BAKEOFF.md) for the measured comparison and [`.claude/plans/`](.claude/plans/) for the plan.
+
+<!-- project-knowledge-harness:readme-roadmap -->
+
+## Roadmap & lessons learned
+
+Future work is indexed in [TODO.md](TODO.md); research lives in [backlog/](backlog/)
+and resolved debugging traps in [pitfalls/](pitfalls/).
+See [remote image paste notes](backlog/remote-image-paste.md) for the Herdr/Moshi
+comparison and an opt-in SSH/Mosh integration proposal (research only, zh-TW).
+
+<!-- project-knowledge-harness:readme-roadmap (end) -->
